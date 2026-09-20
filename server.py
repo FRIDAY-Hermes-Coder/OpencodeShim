@@ -11,6 +11,7 @@ data: and file:// but rejects bare paths (500) and http(s) URLs (400).
 import base64
 import json
 import os
+import re
 import subprocess
 import threading
 import time
@@ -336,7 +337,124 @@ def extract_text(content):
     return text
 
 
-def messages_to_prompt(messages, tools=None):
+TOOLCALL_FENCE = "hermes-toolcalls"
+TOOLS_JSON_BUDGET = int(os.environ.get("SHIM_TOOLS_JSON_BUDGET", "24000"))
+
+
+def tool_names(tools):
+    names = []
+    for t in tools or []:
+        if not isinstance(t, dict):
+            continue
+        fn = t.get("function")
+        if isinstance(fn, dict) and fn.get("name"):
+            names.append(str(fn["name"]))
+        elif isinstance(t.get("name"), str):
+            names.append(t["name"])
+    return names
+
+
+def build_tools_instruction(tools, tool_choice):
+    """Prompt block teaching opencode how to emit Hermes tool calls (or not)."""
+    if not tools:
+        return ""
+    if tool_choice == "none":
+        return ("\n\n[Tools are defined but tool_choice='none': answer directly in plain "
+                "text. Do NOT emit tool calls.]")
+    try:
+        full = json.dumps(tools)
+    except Exception:
+        full = str(tools)[:TOOLS_JSON_BUDGET]
+    if len(full) > TOOLS_JSON_BUDGET:
+        brief = []
+        for t in tools:
+            try:
+                s = json.dumps(t)
+            except Exception:
+                s = str(t)
+            brief.append(s[:1500])
+        full = "[" + ", ".join(brief) + "]"[:TOOLS_JSON_BUDGET] + "...(truncated)"
+    names = tool_names(tools)
+    must = ""
+    if tool_choice == "required":
+        must = " You MUST call a tool (do not answer directly)."
+    elif isinstance(tool_choice, dict):
+        fn = tool_choice.get("function", {})
+        want = fn.get("name") if isinstance(fn, dict) else None
+        if want:
+            must = f" You MUST call the tool named '{want}' (do not answer directly)."
+    return (
+        "\n\n[You have Hermes tools available." + must +
+        " To call one or more tools, output ONLY a fenced block:\n"
+        "```" + TOOLCALL_FENCE + "\n"
+        '[{"name": "<tool-name>", "arguments": {<json-object-args>}}]\n'
+        "```\n"
+        "Rules: use only these tool names: " + ", ".join(names[:100]) + ". "
+        "Arguments must be a single JSON object matching that tool's parameters schema "
+        "(use {} if it takes none). No prose outside the fence when calling tools. "
+        "To answer directly instead, output plain text with no fence.]\n"
+        "Tool definitions: " + full
+    )
+
+
+def extract_tool_calls(text, tools):
+    """Parse opencode output for a Hermes tool-call fence.
+
+    Returns (calls, remaining_text) where calls = [{"name","arguments":dict}].
+    Falls back to ([], text) when no valid fence is found.
+    """
+    valid = set(tool_names(tools))
+    if not valid or not text or "```" not in text:
+        # also accept a bare JSON array as the whole message
+        if text:
+            s = text.strip()
+            if s.startswith("[") and valid:
+                try:
+                    obj = json.loads(s)
+                except Exception:
+                    return [], text
+                calls, ok = _coerce_calls(obj, valid)
+                if ok:
+                    return calls, ""
+        return [], text
+    blocks = re.findall(r"```(?:[\w-]+)?\s*\n?(.*?)```", text, re.S)
+    for b in blocks:
+        b = b.strip()
+        if not b:
+            continue
+        try:
+            obj = json.loads(b)
+        except Exception:
+            continue
+        calls, ok = _coerce_calls(obj if isinstance(obj, list) else [obj], valid)
+        if ok:
+            # drop the first fenced block; keep any surrounding prose as content
+            remaining = re.sub(r"```(?:[\w-]+)?\s*\n?.*?```", "", text, count=1, flags=re.S).strip()
+            return calls, remaining
+    return [], text
+
+
+def _coerce_calls(items, valid):
+    calls = []
+    for it in items:
+        if not isinstance(it, dict):
+            return [], False
+        name = it.get("name")
+        if not isinstance(name, str) or name not in valid:
+            return [], False
+        args = it.get("arguments", {})
+        if isinstance(args, str):
+            try:
+                args = json.loads(args) if args.strip() else {}
+            except Exception:
+                return [], False
+        if not isinstance(args, dict):
+            return [], False
+        calls.append({"name": name, "arguments": args})
+    return (calls, True) if calls else ([], False)
+
+
+def messages_to_prompt(messages, tools=None, tool_choice=None):
     lines, atts = [], []
     if isinstance(messages, str):
         messages = [{"role": "user", "content": messages}]
@@ -350,9 +468,18 @@ def messages_to_prompt(messages, tools=None):
         text, imgs = extract_text_and_images(m.get("content"))
         atts.extend(imgs)
         if m.get("tool_calls"):
-            text += f"\n[tool_calls requested in history: {json.dumps(m.get('tool_calls'))[:2000]}]"
+            try:
+                tc_summary = []
+                for tc in m["tool_calls"]:
+                    fn = (tc.get("function") or {}) if isinstance(tc, dict) else {}
+                    tc_summary.append(f"{tc.get('id', '?')}={fn.get('name', '?')}({str(fn.get('arguments', ''))[:800]})")
+                text += "\n[assistant tool_calls in history: " + "; ".join(tc_summary) + "]"
+            except Exception:
+                text += f"\n[tool_calls in history: {json.dumps(m.get('tool_calls'))[:2000]}]"
         if m.get("tool_call_id"):
-            role = f"TOOL_RESULT({m.get('name', m.get('tool_call_id'))})"
+            role = f"TOOL_RESULT({m.get('name') or m.get('tool_call_id')})"
+            if len(text) > 3000:
+                text = text[:3000] + "...(truncated)"
         lines.append(f"{role}: {text}")
     prompt = "\n\n".join(lines).strip()
     if atts:
@@ -363,15 +490,9 @@ def messages_to_prompt(messages, tools=None):
         prompt = ("Describe the attached file(s) in detail. If video, summarize key moments. "
                   "If PDF, summarize contents. If audio, transcribe/summarize. " + prompt).strip()
     if tools:
-        try:
-            tools_hint = json.dumps(tools)[:4000]
-        except Exception:
-            tools_hint = str(tools)[:4000]
-        prompt += (
-            "\n\n[Context: Hermes supplied these tool definitions, but you are opencode "
-            "running agentic-delegation mode. Use your own opencode tools to complete the task "
-            "and return the final answer as plain text. Do not emit Hermes tool_calls JSON, "
-            "just answer.]\nTools hint: " + tools_hint
+        instr = build_tools_instruction(tools, tool_choice)
+        prompt += instr if instr else (
+            "\n\n[Context: no usable Hermes tool names found; answer in plain text.]"
         )
     return (prompt or "Say hi"), atts
 
@@ -403,7 +524,7 @@ def run_opencode(prompt, images=None):
     normalize_attachments(). Kept tolerant: raw (mime, url) pairs are normalized
     here as a fallback (holds the semaphore; prefer normalizing before acquire).
     """
-    ok, health = _serve_call("GET", "/global/health", timeout=5)
+    ok, health = _serve_call("GET", "/global/health", timeout=15)
     if not ok:
         return False, "", f"opencode serve down ({health}). Check `systemctl --user status opencode-serve`."
     norm = []
@@ -475,6 +596,71 @@ def run_opencode_subprocess(prompt):
     return True, p.stdout.strip(), p.stderr.strip()
 
 
+def chat_completion_tool_response(model, content, calls):
+    tcs = []
+    for c in calls:
+        tcs.append({
+            "id": f"call_{uuid.uuid4().hex[:12]}",
+            "type": "function",
+            "function": {"name": c["name"], "arguments": json.dumps(c["arguments"])},
+        })
+    return {
+        "id": f"chatcmpl-{uuid.uuid4().hex[:12]}",
+        "object": "chat.completion",
+        "created": int(time.time()),
+        "model": model or MODEL_ID,
+        "choices": [
+            {
+                "index": 0,
+                "message": {"role": "assistant", "content": content, "tool_calls": tcs},
+                "finish_reason": "tool_calls",
+            }
+        ],
+        "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+    }
+
+
+def _sse_send_tool_calls(self, cid, created, req_model, content, calls):
+    """SSE variant for tool_calls responses (Hermes streams with stream:true)."""
+    try:
+        delta_calls = []
+        for i, c in enumerate(calls):
+            delta_calls.append({
+                "index": i,
+                "id": f"call_{uuid.uuid4().hex[:12]}",
+                "type": "function",
+                "function": {"name": c["name"], "arguments": json.dumps(c["arguments"])},
+            })
+        # keep ids stable between delta and final not required by most clients
+        chunk = {"id": cid, "object": "chat.completion.chunk", "created": created,
+                 "model": req_model,
+                 "choices": [{"index": 0,
+                              "delta": {"role": "assistant", "content": content,
+                                        "tool_calls": delta_calls},
+                              "finish_reason": None}]}
+        self.wfile.write(f"data: {json.dumps(chunk)}\n\n".encode())
+        done = {"id": cid, "object": "chat.completion.chunk", "created": created,
+                "model": req_model,
+                "choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}]}
+        self.wfile.write(f"data: {json.dumps(done)}\n\ndata: [DONE]\n\n".encode())
+    except (BrokenPipeError, ConnectionResetError):
+        pass
+
+
+def _sse_send_text(self, cid, created, req_model, out):
+    try:
+        chunk = {"id": cid, "object": "chat.completion.chunk", "created": created,
+                 "model": req_model,
+                 "choices": [{"index": 0, "delta": {"role": "assistant", "content": out}, "finish_reason": None}]}
+        self.wfile.write(f"data: {json.dumps(chunk)}\n\n".encode())
+        done = {"id": cid, "object": "chat.completion.chunk", "created": created,
+                "model": req_model,
+                "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}
+        self.wfile.write(f"data: {json.dumps(done)}\n\ndata: [DONE]\n\n".encode())
+    except (BrokenPipeError, ConnectionResetError):
+        pass
+
+
 def chat_completion_response(model, content):
     return {
         "id": f"chatcmpl-{uuid.uuid4().hex[:12]}",
@@ -493,7 +679,7 @@ def chat_completion_response(model, content):
 
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = "OpencodeShim/2.0"
+    server_version = "OpencodeShim/2.1"
 
     def log_message(self, fmt, *args):
         print(f"[{time.strftime('%H:%M:%S')}] {self.address_string()} {fmt % args}")
@@ -536,6 +722,7 @@ class Handler(BaseHTTPRequestHandler):
             self._json(200, {"ok": True, "model": OPENCODE_MODEL, "mode": "opencode-serve", "serve": SERVE_URL,
                              "attachments_supported": ["image", "pdf"],
                              "attachments_pending": ["video", "audio"],
+                             "function_calling": True,
                              "attachments_note": "opencode serve 1.18.31 rejects video/audio file parts; set SHIM_ENABLE_VIDEO/AUDIO=1 to forward anyway on newer serve."})
         else:
             self._json(404, {"error": {"message": f"not found: {path}", "type": "not_found"}})
@@ -558,9 +745,15 @@ class Handler(BaseHTTPRequestHandler):
 
         messages = body.get("messages", [])
         tools = body.get("tools")
+        tool_choice = body.get("tool_choice")
         stream = bool(body.get("stream"))
         req_model = body.get("model") or MODEL_ID
-        prompt, atts_raw = messages_to_prompt(messages, tools)
+        prompt, atts_raw = messages_to_prompt(messages, tools, tool_choice)
+        if tools:
+            try:
+                print(f"[tools] n={len(tools)} names={tool_names(tools)[:15]} choice={str(tool_choice)[:120]}")
+            except Exception:
+                pass
 
         # Normalize attachments BEFORE acquiring the LLM slot: downloads/reads
         # must not hold semaphore. Bad files -> fast 400, no retry burn.
@@ -615,6 +808,34 @@ class Handler(BaseHTTPRequestHandler):
             self._json(status, {"error": {"message": msg[:4000], "type": "backend_error", "output": out[:2000]}})
             return
 
+        # Tool-call bridge: if Hermes offered tools, let opencode's output decide.
+        # Fenced ```hermes-toolcalls JSON -> OpenAI tool_calls response (Hermes
+        # executes tools and loops back with role:tool results). Anything else ->
+        # plain text (opencode may still have used its own tools internally).
+        calls, remaining = ([], out)
+        if tools and tool_choice != "none":
+            try:
+                calls, remaining = extract_tool_calls(out, tools)
+            except Exception as e:
+                print(f"[tools] parse failed: {e}")
+                calls, remaining = [], out
+            if calls:
+                print(f"[tools] emitting {len(calls)} call(s): {[c['name'] for c in calls]}")
+                resp = chat_completion_tool_response(req_model, remaining or None, calls)
+                if not stream:
+                    self._json(200, resp)
+                    return
+                cid, created = resp["id"], resp["created"]
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.send_header("Cache-Control", "no-cache")
+                self.send_header("Connection", "keep-alive")
+                self._cors()
+                self.end_headers()
+                _sse_send_tool_calls(self, cid, created, req_model, remaining or None, calls)
+                return
+            out = remaining
+
         resp = chat_completion_response(req_model, out)
         if not stream:
             self._json(200, resp)
@@ -629,17 +850,7 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Connection", "keep-alive")
         self._cors()
         self.end_headers()
-        try:
-            chunk = {"id": cid, "object": "chat.completion.chunk", "created": created,
-                     "model": req_model,
-                     "choices": [{"index": 0, "delta": {"role": "assistant", "content": out}, "finish_reason": None}]}
-            self.wfile.write(f"data: {json.dumps(chunk)}\n\n".encode())
-            done = {"id": cid, "object": "chat.completion.chunk", "created": created,
-                    "model": req_model,
-                    "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}
-            self.wfile.write(f"data: {json.dumps(done)}\n\ndata: [DONE]\n\n".encode())
-        except (BrokenPipeError, ConnectionResetError):
-            pass
+        _sse_send_text(self, cid, created, req_model, out)
 
 
 def main():

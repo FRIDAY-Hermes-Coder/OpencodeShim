@@ -141,6 +141,22 @@ Prompt tweaks in `messages_to_prompt`:
 4. Run §7 tests; check `journalctl --user -u opencode-shim -n 50`.
 5. Send one real Hermes message (text + small image) via linked channel.
 
+## 9b. Tool-call bridge (shim v2.1, 2026-09-20)
+
+Hermes sends standard OpenAI `tools` + `tool_choice` and loops on `tool_calls`
+(up to 150 turns); opencode serve has no such passthrough (its `tools` param is
+just `{name: bool}` enable flags). Shim bridges them:
+
+- Prompt: full tool schemas (24k budget) + fence protocol
+  (```hermes-toolcalls `[{"name","arguments"}]`); `tool_choice:none` forces text.
+- Parse: fenced block or bare JSON array, names validated against offered tools.
+- Valid fence -> `200 {tool_calls, finish_reason:tool_calls}` (+ SSE delta variant);
+  Hermes executes and returns `role:tool` results, flattened into the next prompt.
+- No/invalid fence -> plain text as before (opencode may still use its own
+  file/bash tools internally = delegation).
+- Verified: tools+text, tool_choice:none, history loop, SSE; unknown tools rejected.
+- Serve health timeout raised 5s->15s (flaked once under load).
+
 ## 9. Non-goals
 
 - No public bind, no auth layer, no TLS (loopback only).
