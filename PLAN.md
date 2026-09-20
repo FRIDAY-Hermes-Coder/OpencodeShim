@@ -157,9 +157,25 @@ just `{name: bool}` enable flags). Shim bridges them:
 - Verified: tools+text, tool_choice:none, history loop, SSE; unknown tools rejected.
 - Serve health timeout raised 5s->15s (flaked once under load).
 
-## 9. Non-goals
+## 10. All-file-types support (shim v2.2, 2026-09-21)
+
+Probe results (serve 1.18.31): `text/plain` accepted as file part;
+`application/zip`, `application/json` rejected (same media-type error as
+video/audio). Pipeline per attachment (after video/audio 400-gate):
+
+- `image/*`, `application/pdf`, `text/*` -> file part (data: URL).
+- Other mimes: UTF-8 decodable + <=256kB (`SHIM_MAX_TEXT_INLINE_BYTES`) ->
+  re-sent as `text/plain` part with original filename (covers json/csv/code).
+- Other binary (zip/apk/tar/...): staged under `WORKDIR/.shim-inbox/` (copied
+  when outside WORKDIR so opencode tools can reach it; cap `SHIM_MAX_FILE_BYTES`
+  50MB) + prompt note with absolute path; opencode inspects via read/bash.
+- Verified E2E: zip path -> `hello.txt` via tools; json path -> `1` inline.
+- Ops: shim unit now runs `python3 -u` so `[tools]`/`[attachments]` lines reach
+  the journal live (was block-buffered, invisible).
+- Telegram-zip slowness RCA (2026-09-21 00:02): opencode turn ran 214s with no
+  output (Hermes stale detector); no shim/serve outage. Note Telegram bots cap
+  files at 50MB — oversized zips fail/slow at upload regardless of shim.
 
 - No public bind, no auth layer, no TLS (loopback only).
 - No downscaling/compression of media (user keeps files small).
-- No audio input support in this round (model allows it; add later if needed).
 - No Hermes config change needed (already pointed at shim).

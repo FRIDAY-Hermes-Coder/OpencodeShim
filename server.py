@@ -54,6 +54,12 @@ MAX_IMAGE_BYTES = int(os.environ.get("SHIM_MAX_IMAGE_BYTES", str(12 * 1024 * 102
 MAX_VIDEO_BYTES = int(os.environ.get("SHIM_MAX_VIDEO_BYTES", str(25 * 1024 * 1024)))
 MAX_PDF_BYTES = int(os.environ.get("SHIM_MAX_PDF_BYTES", str(12 * 1024 * 1024)))
 MAX_AUDIO_BYTES = int(os.environ.get("SHIM_MAX_AUDIO_BYTES", str(12 * 1024 * 1024)))
+# Generic binary (zip, apk, tar, ...): staged to inbox, never embedded.
+MAX_FILE_BYTES = int(os.environ.get("SHIM_MAX_FILE_BYTES", str(50 * 1024 * 1024)))
+# Non-forwardable mimes that UTF-8 decode within this size are re-sent as
+# text/plain file parts (serve accepts text/*). Larger text -> inbox path ref.
+MAX_TEXT_INLINE_BYTES = int(os.environ.get("SHIM_MAX_TEXT_INLINE_BYTES", str(256 * 1024)))
+INBOX_NAME = os.environ.get("SHIM_INBOX_NAME", ".shim-inbox")
 # opencode serve 1.18.31 rejects video/* + audio/* file parts
 # ("'file part media type video/mp4/audio/wav' functionality not supported"),
 # even though model caps list them. Gate them with a clear 400 until serve
@@ -63,14 +69,54 @@ ENABLE_AUDIO = os.environ.get("SHIM_ENABLE_AUDIO", "0") == "1"
 
 
 def is_forwardable(mime):
+    """Mimes serve accepts as file parts. Video/audio gated by enable flags."""
     m = (mime or "").lower()
-    if m.startswith("image/") or m == "application/pdf":
+    if m.startswith("image/") or m == "application/pdf" or m.startswith("text/"):
         return True
     if m.startswith("video/"):
         return ENABLE_VIDEO
     if m.startswith("audio/"):
         return ENABLE_AUDIO
     return False
+
+
+def is_gated_media(mime):
+    """Video/audio serve rejects outright -> explicit 400 instead of fallback."""
+    m = (mime or "").lower()
+    if m.startswith("video/"):
+        return not ENABLE_VIDEO
+    if m.startswith("audio/"):
+        return not ENABLE_AUDIO
+    return False
+
+
+def inbox_dir():
+    d = os.path.join(WORKDIR, INBOX_NAME)
+    try:
+        os.makedirs(d, exist_ok=True)
+    except Exception:
+        pass
+    return d
+
+
+def stage_to_inbox(filename, data):
+    """Write bytes into WORKDIR inbox so opencode tools can read them. Returns abs path."""
+    d = inbox_dir()
+    safe = re.sub(r"[^A-Za-z0-9._-]+", "_", os.path.basename(filename or "attachment"))[:100] or "attachment"
+    name = f"{uuid.uuid4().hex[:8]}-{safe}"
+    if len(data) > MAX_FILE_BYTES:
+        raise ValueError(f"file too large ({len(data)} bytes, max {MAX_FILE_BYTES}). [file]")
+    path = os.path.join(d, name)
+    with open(path, "wb") as f:
+        f.write(data)
+    return path
+
+
+def data_url_to_bytes(url):
+    header, _, b64 = url.partition(",")
+    if ";base64" in header:
+        return base64.b64decode("".join(b64.split()))
+    return b64.encode("utf-8", "replace")
 
 
 def limit_for_mime(mime):
@@ -81,7 +127,9 @@ def limit_for_mime(mime):
         return MAX_PDF_BYTES
     if m.startswith("audio/"):
         return MAX_AUDIO_BYTES
-    return MAX_IMAGE_BYTES
+    if m.startswith("image/") or m.startswith("text/"):
+        return MAX_IMAGE_BYTES
+    return MAX_FILE_BYTES
 
 
 def _allowed_mime(mime):
@@ -226,9 +274,9 @@ def validate_data_url(url):
         header, _, b64 = url.partition(",")
         if not header.startswith("data:") or not b64:
             raise ValueError("malformed data URL (missing data payload)")
-        mime = header[5:].split(";")[0].strip() or "image/jpeg"
-        if not _allowed_mime(mime):
-            raise ValueError(f"unsupported data URL mime {mime}. Send image/video/pdf/audio only. [image_url]")
+        mime = header[5:].split(";")[0].strip() or "application/octet-stream"
+        # Any mime allowed here; serve-side gating happens later (forwardable /
+        # text-inline / inbox path). Only the byte cap is enforced.
         limit = limit_for_mime(mime)
         if ";base64" in header:
             est = len("".join(b64.split())) * 3 // 4
@@ -245,8 +293,8 @@ def validate_data_url(url):
         raise ValueError(f"bad data URL attachment: {e} [image_url]")
 
 
-def file_to_data_url(ref):
-    """Read file:// or bare local path -> (mime, data: URL, filename)."""
+def file_to_data_url_with_path(ref):
+    """Read file:// or bare local path -> (mime, data: URL, filename, abs_path)."""
     raw_ref = ref
     path = ref.replace("file://", "", 1)
     path = os.path.expanduser(path)
@@ -256,9 +304,7 @@ def file_to_data_url(ref):
     if not os.path.isfile(path):
         raise ValueError(f"local file not found: {raw_ref} (resolved {path}) [image_url]")
     ext = os.path.splitext(path)[1].lower()
-    mime = MIME_BY_EXT.get(ext, "image/jpeg")
-    if not _allowed_mime(mime):
-        raise ValueError(f"unsupported file type {ext or '?'} ({mime}) for {path}. Send image/video/pdf/audio only. [image_url]")
+    mime = MIME_BY_EXT.get(ext, "application/octet-stream")
     limit = limit_for_mime(mime)
     size = os.path.getsize(path)
     if size > limit:
@@ -267,7 +313,13 @@ def file_to_data_url(ref):
         raw = f.read(limit + 1)
     if len(raw) > limit:
         raise ValueError(f"file too large (max {limit} for {mime}): {path} [image_url]")
-    return mime, f"data:{mime};base64," + base64.b64encode(raw).decode(), os.path.basename(path)
+    return mime, f"data:{mime};base64," + base64.b64encode(raw).decode(), os.path.basename(path), path
+
+
+def file_to_data_url(ref):
+    """Read file:// or bare local path -> (mime, data: URL, filename)."""
+    mime, data_url, fn, _path = file_to_data_url_with_path(ref)
+    return mime, data_url, fn
 
 
 def download_http_to_data_url(url):
@@ -280,17 +332,14 @@ def download_http_to_data_url(url):
             except Exception:
                 ctype = (r.headers.get("Content-Type", "") or "").split(";")[0].strip().lower()
             ctype = (ctype or "").lower().split(";")[0].strip()
-            _mime_g, fn_guess = _guess_mime_and_name(url)
-            hard_cap = max(MAX_IMAGE_BYTES, MAX_VIDEO_BYTES, MAX_PDF_BYTES, MAX_AUDIO_BYTES) + 1
+            _mime_g, fn_guess = _guess_mime_and_name(url, default="application/octet-stream")
+            hard_cap = max(MAX_IMAGE_BYTES, MAX_VIDEO_BYTES, MAX_PDF_BYTES, MAX_AUDIO_BYTES, MAX_FILE_BYTES) + 1
             raw = r.read(hard_cap)
             mime = None
-            if ctype and "/" in ctype and _allowed_mime(ctype):
+            if ctype and "/" in ctype:
                 mime = ctype
             if not mime:
                 mime = _mime_g
-            if not _allowed_mime(mime):
-                raise ValueError(
-                    f"unsupported Content-Type {ctype or mime} for {url}. Send image/video/pdf/audio only. [image_url]")
             limit = limit_for_mime(mime)
             if len(raw) > limit:
                 raise ValueError(
@@ -308,21 +357,73 @@ def download_http_to_data_url(url):
 
 
 def normalize_attachments(atts_raw):
-    """Convert [(mime_guess, ref, filename)] -> [(mime, data_url, filename)]. All data: URLs for serve."""
+    """Convert [(mime_guess, ref, filename)] -> [(mime, data_url, filename, src_path)].
+
+    All payloads become data: URLs for serve. src_path is the absolute local
+    path when the ref was a file:// or bare path (else None) — used for the
+    inbox fallback for types serve rejects.
+    """
     out = []
     for _mime_g, ref, fn_g in atts_raw or []:
         if not ref or not isinstance(ref, str):
             continue
         if ref.startswith("data:"):
             mime, data_url, _ = validate_data_url(ref)
-            out.append((mime, data_url, fn_g))
+            out.append((mime, data_url, fn_g, None))
         elif ref.startswith(("http://", "https://")):
             mime, data_url, fn = download_http_to_data_url(ref)
-            out.append((mime, data_url, fn or fn_g))
+            out.append((mime, data_url, fn or fn_g, None))
         else:
-            mime, data_url, fn = file_to_data_url(ref)
-            out.append((mime, data_url, fn or fn_g))
+            mime, data_url, fn, src = file_to_data_url_with_path(ref)
+            out.append((mime, data_url, fn or fn_g, src))
     return out
+
+
+def prepare_file_inputs(normed):
+    """Split normalized attachments into serve file-parts + prompt notes.
+
+    Returns (parts, notes) where parts = [{"type":"file",...}] for serve and
+    notes = [str] describing inbox-staged binaries opencode should read via tools.
+    Raises ValueError for gated video/audio (explicit 400 upstream).
+    """
+    parts, notes = [], []
+    for mime, data_url, filename, src_path in normed:
+        if is_gated_media(mime):
+            raise ValueError(
+                f"{mime.split('/')[0]} attachment(s) not supported by opencode serve "
+                f"(model caps list it but serve rejects it). Supported now: image + pdf + text + "
+                f"generic files via tool-readable path. Workaround: transcribe/describe the media "
+                f"first and send text. Files: {filename or 'unknown'}. [audio/video]")
+        if is_forwardable(mime):
+            fp = {"type": "file", "mime": mime, "url": data_url}
+            if filename:
+                fp["filename"] = os.path.basename(str(filename))[:120]
+            parts.append(fp)
+            continue
+        # Non-forwardable (zip, apk, tar, ...): small UTF-8 text -> text/plain part.
+        raw = data_url_to_bytes(data_url)
+        if len(raw) <= MAX_TEXT_INLINE_BYTES:
+            try:
+                text = raw.decode("utf-8")
+            except UnicodeDecodeError:
+                text = None
+            if text is not None and ("\x00" not in text):
+                fp = {"type": "file", "mime": "text/plain",
+                      "url": "data:text/plain;base64," + base64.b64encode(raw).decode()}
+                if filename:
+                    fp["filename"] = os.path.basename(str(filename))[:120]
+                parts.append(fp)
+                continue
+        # Binary fallback: tool-readable path in WORKDIR inbox.
+        if src_path and os.path.isfile(src_path) and src_path.startswith(os.path.abspath(WORKDIR) + os.sep):
+            usable = src_path
+        else:
+            usable = stage_to_inbox(filename or "attachment", raw)
+        notes.append(
+            f"[attached file: {filename or 'attachment'} ({mime}, {len(raw)} bytes) "
+            f"saved at: {usable} — serve file-parts reject this type, so use your "
+            f"tools (read/bash) to inspect it. Do not ask the user for the path.]")
+    return parts, notes
 
 
 def load_url_or_path(url):
@@ -517,34 +618,36 @@ def _serve_call(method, path, payload=None, timeout=30):
         return False, f"serve unreachable: {e}"
 
 
-def run_opencode(prompt, images=None):
+def run_opencode(prompt, images=None, file_parts=None):
     """Fast path: warm serve daemon (no subprocess cold boot).
 
-    images must already be normalized [(mime, data_url, filename)] — see
-    normalize_attachments(). Kept tolerant: raw (mime, url) pairs are normalized
-    here as a fallback (holds the semaphore; prefer normalizing before acquire).
+    Preferred: pass ready serve file-parts via file_parts (see
+    prepare_file_inputs()). Legacy: images as normalized
+    [(mime, data_url, filename[, src_path])] tuples are converted here.
     """
     ok, health = _serve_call("GET", "/global/health", timeout=15)
     if not ok:
         return False, "", f"opencode serve down ({health}). Check `systemctl --user status opencode-serve`."
-    norm = []
-    for item in images or []:
-        if len(item) == 3:
-            norm.append(item)
-        elif len(item) == 2:
-            mime, ref = item
-            try:
-                norm.extend(normalize_attachments([(mime, ref, None)]))
-            except Exception as e:
-                return False, "", f"bad attachment: {e}"
-        else:
-            return False, "", f"bad attachment entry: {item!r}"[:500]
-    parts = [{"type": "text", "text": prompt}]
-    for mime, data_url, filename in norm:
-        fp = {"type": "file", "mime": mime, "url": data_url}
-        if filename:
-            fp["filename"] = os.path.basename(str(filename))[:120]
-        parts.append(fp)
+    if file_parts is None:
+        norm = []
+        for item in images or []:
+            if len(item) >= 3:
+                norm.append(item[:3])
+            elif len(item) == 2:
+                mime, ref = item
+                try:
+                    norm.extend([t[:3] for t in normalize_attachments([(mime, ref, None)])])
+                except Exception as e:
+                    return False, "", f"bad attachment: {e}"
+            else:
+                return False, "", f"bad attachment entry: {item!r}"[:500]
+        file_parts = []
+        for mime, data_url, filename in norm:
+            fp = {"type": "file", "mime": mime, "url": data_url}
+            if filename:
+                fp["filename"] = os.path.basename(str(filename))[:120]
+            file_parts.append(fp)
+    parts = [{"type": "text", "text": prompt}] + list(file_parts or [])
     ok, sess = _serve_call("POST", "/session", {}, timeout=15)
     if not ok or "id" not in sess:
         return False, "", f"session create failed: {sess}"
@@ -720,7 +823,9 @@ class Handler(BaseHTTPRequestHandler):
             })
         elif path in ("/health", "/v1/health", "/"):
             self._json(200, {"ok": True, "model": OPENCODE_MODEL, "mode": "opencode-serve", "serve": SERVE_URL,
-                             "attachments_supported": ["image", "pdf"],
+                             "attachments_supported": ["image", "pdf", "text/*"],
+                             "attachments_converted": ["any UTF-8 text (json, csv, code, ...) -> text/plain part"],
+                             "attachments_staged": ["other binary (zip, apk, tar, ...) -> tool-readable path in WORKDIR inbox"],
                              "attachments_pending": ["video", "audio"],
                              "function_calling": True,
                              "attachments_note": "opencode serve 1.18.31 rejects video/audio file parts; set SHIM_ENABLE_VIDEO/AUDIO=1 to forward anyway on newer serve."})
@@ -758,7 +863,7 @@ class Handler(BaseHTTPRequestHandler):
         # Normalize attachments BEFORE acquiring the LLM slot: downloads/reads
         # must not hold semaphore. Bad files -> fast 400, no retry burn.
         try:
-            images = normalize_attachments(atts_raw)
+            normed = normalize_attachments(atts_raw)
         except ValueError as e:
             self._json(400, {"error": {"message": str(e)[:2000], "type": "invalid_request"}})
             return
@@ -766,26 +871,24 @@ class Handler(BaseHTTPRequestHandler):
             self._json(400, {"error": {"message": f"bad attachment: {e}"[:2000], "type": "invalid_request"}})
             return
 
-        # Gate media types serve can't handle yet (video/audio) with a clear 400
-        # instead of forwarding to an empty/error reply.
-        blocked = [(m, f) for m, _u, f in images if not is_forwardable(m)]
-        if blocked:
-            kinds = sorted({m.split("/")[0] for m, _f in blocked})
-            names = ", ".join([f for _m, f in blocked if f][:5])
-            self._json(400, {"error": {
-                "message": (f"{'/'.join(kinds)} attachment(s) not supported by opencode serve 1.18.31 "
-                            f"('file part media type' not supported; model caps list it but serve rejects it). "
-                            f"Supported now: image + pdf. Pending: video/audio. "
-                            f"Workaround: transcribe/describe the media first and send text. "
-                            f"Files: {names or 'unknown'}. [audio/video]"),
-                "type": "invalid_request"}})
+        # Split into serve file-parts vs tool-readable inbox notes. Gated
+        # video/audio raise ValueError -> explicit 400 with workaround.
+        try:
+            file_parts, file_notes = prepare_file_inputs(normed)
+        except ValueError as e:
+            self._json(400, {"error": {"message": str(e)[:2000], "type": "invalid_request"}})
             return
+        except Exception as e:
+            self._json(400, {"error": {"message": f"bad attachment: {e}"[:2000], "type": "invalid_request"}})
+            return
+        if file_notes:
+            prompt += "\n\n" + "\n".join(file_notes)
 
-        if images:
+        if file_parts or file_notes:
             try:
-                total_b64 = sum(len(u) for _m, u, _f in images)
-                mimes = sorted({m for m, _u, _f in images})
-                print(f"[attachments] n={len(images)} mimes={mimes} b64chars={total_b64}")
+                total_b64 = sum(len(p.get("url", "")) for p in file_parts)
+                mimes = sorted({p.get("mime", "?") for p in file_parts})
+                print(f"[attachments] parts={len(file_parts)} notes={len(file_notes)} mimes={mimes} b64chars={total_b64}")
             except Exception:
                 pass
 
@@ -794,7 +897,7 @@ class Handler(BaseHTTPRequestHandler):
             self._json(429, {"error": {"message": "busy: another opencode run in progress, retry shortly", "type": "rate_limit"}})
             return
         try:
-            ok, out, err = run_opencode(prompt, images)
+            ok, out, err = run_opencode(prompt, file_parts=file_parts)
         finally:
             _sem.release()
 
