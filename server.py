@@ -782,7 +782,7 @@ def chat_completion_response(model, content):
 
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = "OpencodeShim/2.1"
+    server_version = "OpencodeShim/2.2"
 
     def log_message(self, fmt, *args):
         print(f"[{time.strftime('%H:%M:%S')}] {self.address_string()} {fmt % args}")
@@ -809,18 +809,28 @@ class Handler(BaseHTTPRequestHandler):
         self._cors()
         self.end_headers()
 
+    def _model_object(self):
+        return {
+            "id": MODEL_ID,
+            "object": "model",
+            "created": int(time.time()),
+            "owned_by": "opencode-shim",
+        }
+
     def do_GET(self):
+        from urllib.parse import unquote
         path = urlparse(self.path).path.rstrip("/") or "/"
         if path in ("/v1/models", "/models"):
             self._json(200, {
                 "object": "list",
-                "data": [{
-                    "id": MODEL_ID,
-                    "object": "model",
-                    "created": int(time.time()),
-                    "owned_by": "opencode-shim",
-                }],
+                "data": [self._model_object()],
             })
+        elif path in ("/v1/models/" + MODEL_ID, "/models/" + MODEL_ID):
+            self._json(200, self._model_object())
+        elif path.startswith(("/v1/models/", "/models/")):
+            # OpenAI-compatible retrieve: unknown ids 404 like the real API.
+            mid = unquote(path.rsplit("/", 1)[-1])
+            self._json(404, {"error": {"message": f"model not found: {mid}", "type": "invalid_request"}})
         elif path in ("/health", "/v1/health", "/"):
             self._json(200, {"ok": True, "model": OPENCODE_MODEL, "mode": "opencode-serve", "serve": SERVE_URL,
                              "attachments_supported": ["image", "pdf", "text/*"],
