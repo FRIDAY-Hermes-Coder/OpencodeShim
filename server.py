@@ -60,6 +60,12 @@ MAX_FILE_BYTES = int(os.environ.get("SHIM_MAX_FILE_BYTES", str(50 * 1024 * 1024)
 # text/plain file parts (serve accepts text/*). Larger text -> inbox path ref.
 MAX_TEXT_INLINE_BYTES = int(os.environ.get("SHIM_MAX_TEXT_INLINE_BYTES", str(256 * 1024)))
 INBOX_NAME = os.environ.get("SHIM_INBOX_NAME", ".shim-inbox")
+# Preferred search roots (colon-separated). Memory/history matches resolve here
+# first; wide filesystem walks outside these roots are forbidden (see below).
+SEARCH_ROOTS = [r for r in os.environ.get(
+    "SHIM_SEARCH_ROOTS",
+    "/home/mitansh/hermesworkspace:/home/mitansh/work",
+).split(":") if r]
 # opencode serve 1.18.31 rejects video/* + audio/* file parts
 # ("'file part media type video/mp4/audio/wav' functionality not supported"),
 # even though model caps list them. Gate them with a clear 400 until serve
@@ -555,6 +561,29 @@ def _coerce_calls(items, valid):
     return (calls, True) if calls else ([], False)
 
 
+def build_search_discipline():
+    """Standing working agreement: memory-first resolution, narrow search.
+
+    Prevents repeats of the 2026-09-21 incident where a 'send me the paper PDF'
+    request triggered a full-home `**/*.pdf` glob + 329MB directory read and
+    stalled for minutes, when Hermes memory already knew the exact file.
+    """
+    roots = ", ".join(SEARCH_ROOTS) if SEARCH_ROOTS else "(none configured)"
+    return (
+        "\n\n[Working agreement — file lookup discipline: "
+        "1) MEMORY FIRST: when the user refers to prior work ('the paper', 'it', "
+        "'earlier', 'that file', 'send me X'), resolve WHAT/WHERE from this "
+        "conversation's history first, then via Hermes memory/session tools if "
+        "offered (fence a call), before touching the filesystem. "
+        "2) SEARCH NARROW: scope globs to these roots only: " + roots + ". "
+        "List the exact directory before any glob. "
+        "3) NEVER run recursive `**` globs or directory reads from `/`, "
+        "`/home/mitansh`, `~`, or other top-level trees — they stall for minutes. "
+        "If the file isn't under the roots, say which roots you checked and ask "
+        "the user for the exact path instead of widening the search.]"
+    )
+
+
 def messages_to_prompt(messages, tools=None, tool_choice=None):
     lines, atts = [], []
     if isinstance(messages, str):
@@ -595,6 +624,7 @@ def messages_to_prompt(messages, tools=None, tool_choice=None):
         prompt += instr if instr else (
             "\n\n[Context: no usable Hermes tool names found; answer in plain text.]"
         )
+    prompt += build_search_discipline()
     return (prompt or "Say hi"), atts
 
 
