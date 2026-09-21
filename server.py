@@ -93,6 +93,83 @@ SHIM_SESSION_LOCK_TIMEOUT = int(os.environ.get("SHIM_SESSION_LOCK_TIMEOUT", "300
 SHIM_MODELS_CACHE_TTL = int(os.environ.get("SHIM_MODELS_CACHE_TTL", "300"))  # seconds
 _models_cache = {"models": [], "updated": 0}
 _models_cache_lock = threading.Lock()
+SHIM_MODEL_FALLBACK = os.environ.get("SHIM_MODEL_FALLBACK", "1") == "1"
+SHIM_MODEL_FALLBACK_RETRIES = int(os.environ.get("SHIM_MODEL_FALLBACK_RETRIES", "3"))
+
+# Power ranking — most powerful first. Clients see this order in /v1/models.
+# Override via SHIM_MODEL_ORDER="model-a,model-b,..." (comma-separated, case-insensitive substrings).
+_MODEL_POWER_ORDER = [s.strip().lower() for s in os.environ.get("SHIM_MODEL_ORDER", "").split(",") if s.strip()] or [
+    "claude-4.5-opus", "claude-4-opus", "claude-4-sonnet", "claude-4",
+    "claude-3.5-sonnet", "claude-3-opus", "claude-3-sonnet", "claude-3-haiku",
+    "gpt-4o", "gpt-4-turbo", "gpt-4", "o1", "o3",
+    "gemini-2.0-pro", "gemini-2.0-flash", "gemini-1.5-pro", "gemini",
+    "deepseek-r1", "deepseek-v3", "deepseek",
+    "llama-3.3-70b", "llama-3.1-405b", "llama-3.1-70b", "llama-3.1-8b", "llama",
+    "qwen2.5-72b", "qwen2.5", "qwen",
+    "muse-spark", "muse",
+]
+
+def _model_power_score(mid):
+    """Lower score = more powerful. Scores by earliest substring match in _MODEL_POWER_ORDER."""
+    low = (mid or "").lower()
+    for idx, pat in enumerate(_MODEL_POWER_ORDER):
+        if pat and pat in low:
+            return idx
+    # Heuristic: larger param count ~ more powerful (405b > 70b > 8b)
+    m = re.search(r"(\d+)b", low)
+    if m:
+        try:
+            # invert: bigger b -> lower (better) offset after unknown bucket
+            return 900 - int(m.group(1))
+        except Exception:
+            pass
+    return 999
+
+def _ranked_models():
+    """All discovered models sorted most-powerful -> least. Uses cached fetch."""
+    try:
+        models = _fetch_models()
+    except Exception:
+        models = []
+    return sorted(models, key=lambda m: (_model_power_score(m.get("id","")), m.get("id","")))
+
+def _fallback_chain(req_model):
+    """Ordered list of model IDs to try: honors explicit request first, then
+    all ranked most-powerful -> least. Keeps *all* discovered models (never
+    filters). When the request is the default (MODEL_ID or empty), the global
+    power order wins so the most powerful model is first.
+    """
+    ranked = _ranked_models()
+    ranked_ids = [m["id"] for m in ranked]
+    # Default / empty request -> pure power order (most powerful first)
+    if not req_model or req_model == MODEL_ID:
+        chain = list(ranked_ids)
+        if MODEL_ID not in chain:
+            chain.append(MODEL_ID)
+        short_def = SHIM_OPENCODE_MODEL.split("/")[-1] if "/" in SHIM_OPENCODE_MODEL else SHIM_OPENCODE_MODEL
+        if short_def not in chain:
+            chain.append(short_def)
+        return chain
+    # Explicit request -> honor it first, then power-ordered rest
+    chain = []
+    seen = set()
+    chain.append(req_model)
+    seen.add(req_model)
+    if "/" in req_model:
+        seen.add(req_model.split("/")[-1])
+    else:
+        for fid in ranked_ids:
+            if fid.split("/")[-1] == req_model:
+                seen.add(fid)
+                break
+    for mid in ranked_ids:
+        if mid in seen or mid.split("/")[-1] in seen:
+            continue
+        chain.append(mid)
+        seen.add(mid)
+        seen.add(mid.split("/")[-1] if "/" in mid else mid)
+    return chain
+
 # --- Phase 2 profiles (§3 plan_enhanced.md) ---
 SHIM_AGENT_LLM = os.environ.get("SHIM_AGENT_LLM", "hermes")       # Profile A: plain model
 SHIM_AGENT_TASK = os.environ.get("SHIM_AGENT_TASK", "hermes-agent")  # Profile B: agentic worker
@@ -534,9 +611,12 @@ def _fetch_models():
                             "owned_by": m.get("owned_by", "opencode"),
                         })
             if normalized:
+                # Rank most powerful first (stable sort)
+                normalized.sort(key=lambda m: (_model_power_score(m["id"]), m["id"]))
                 with _models_cache_lock:
                     _models_cache["models"] = normalized
                     _models_cache["updated"] = now
+                print(f"[models] discovered {len(normalized)} ranked: { [m['id'] for m in normalized[:8]] }")
                 return normalized
     # Serve returned something unexpected; use the configured model as fallback
     return [{"id": MODEL_ID, "object": "model",
@@ -729,9 +809,10 @@ def _do_session_turn(handler, t0, req_id, messages, tools, tool_choice,
         handler.wfile.flush()
         stream_first = False
 
-    def _run_once(exec_sid, exec_prompt, exec_parts):
+    def _run_once(exec_sid, exec_prompt, exec_parts, model_override=None):
         """One turn via event relay; blocking fallback only if async never started."""
-        resolved = _resolve_model(req_model)
+        _eff_model = model_override if model_override is not None else req_model
+        resolved = _resolve_model(_eff_model)
         body = {"model": {"providerID": "opencode", "modelID": resolved},
                 "parts": [{"type": "text", "text": exec_prompt}] + list(exec_parts or [])}
         if agent:
@@ -786,10 +867,33 @@ def _do_session_turn(handler, t0, req_id, messages, tools, tool_choice,
                 _log_req_line(entry)
                 return
         try:
-            ok, out, err, meta_got, used_relay = _run_once(sid, prompt, file_parts)
-            relay_meta.update(meta_got)
-            if not used_relay:
-                stream_live = False
+            # Fallback chain: all discovered models, most powerful first, requested first.
+            _chain = _fallback_chain(req_model) if SHIM_MODEL_FALLBACK else [req_model or MODEL_ID]
+            _chain = _chain[: SHIM_MODEL_FALLBACK_RETRIES + 1]
+            ok = False; out = ""; err = "no attempt"; meta_got = {}; used_relay = True
+            _active_try_model = None
+            for _try_idx, _try_model in enumerate(_chain):
+                _active_try_model = _try_model
+                if _try_idx > 0:
+                    print(f"[fallback] model {req_model} -> {_try_model} after: {err[:120]}")
+                ok, out, err, meta_got, used_relay = _run_once(sid, prompt, file_parts, model_override=_try_model)
+                # _relay_turn may return None meta on failure; guard it
+                if isinstance(meta_got, dict):
+                    relay_meta.update({k: v for k, v in meta_got.items() if v is not None})
+                if not used_relay:
+                    stream_live = False
+                if ok:
+                    if _try_idx > 0:
+                        print(f"[fallback] succeeded with {_try_model}")
+                    break
+                if err.startswith("SESSION_GONE"):
+                    break
+                _low = (err or "").lower()
+                _eligible = any(kw in _low for kw in ["401","unauthorized","api key","overloaded","429","503","rate limit","quota","capacity","model not found","not found","billing","insufficient","forbidden","overload"])
+                if not _eligible:
+                    break
+                if _try_idx >= len(_chain)-1:
+                    break
             if not ok and err.startswith("SESSION_GONE"):
                 # Serve pruned the session; recreate once with a full replay.
                 print(f"[sessions] {sid[:14]} gone on serve, recreating with full replay")
@@ -809,7 +913,7 @@ def _do_session_turn(handler, t0, req_id, messages, tools, tool_choice,
                     fp2, fn2 = prepare_file_inputs(normed2)
                     if fn2:
                         prompt2 += "\n\n" + "\n".join(fn2)
-                    ok, out, err, meta_got2, used_relay2 = _run_once(sid, prompt2, fp2)
+                    ok, out, err, meta_got2, used_relay2 = _run_once(sid, prompt2, fp2, model_override=_active_try_model)
                     relay_meta.update(meta_got2)
                     if not used_relay2:
                         stream_live = False
@@ -2008,7 +2112,7 @@ class Handler(BaseHTTPRequestHandler):
         from urllib.parse import unquote
         path = urlparse(self.path).path.rstrip("/") or "/"
         if path in ("/v1/models", "/models"):
-            models = _fetch_models()
+            models = _ranked_models()
             self._json(200, {
                 "object": "list",
                 "data": models,
@@ -2016,18 +2120,28 @@ class Handler(BaseHTTPRequestHandler):
         elif path in ("/v1/models/" + MODEL_ID, "/models/" + MODEL_ID):
             self._json(200, self._model_object())
         elif path.startswith(("/v1/models/", "/models/")):
-            # OpenAI-compatible retrieve: check discovered models, 404 like the real API if unknown.
+            # OpenAI-compatible retrieve: check discovered models (full or short name), 404 if unknown.
             mid = unquote(path.rsplit("/", 1)[-1])
-            models = _fetch_models()
-            model_ids = {m["id"] for m in models}
-            if mid in model_ids:
-                self._json(200, {"id": mid, "object": "model",
+            models = _ranked_models()
+            # build lookup for both full and short
+            model_ids = set()
+            short_map = {}
+            for m in models:
+                fid = m["id"]
+                model_ids.add(fid)
+                if "/" in fid:
+                    short_map[fid.split("/")[-1]] = fid
+            if mid in model_ids or mid in short_map:
+                lookup = short_map.get(mid, mid)
+                self._json(200, {"id": lookup, "object": "model",
                                   "created": int(time.time()), "owned_by": "opencode-shim"})
             else:
                 self._json(404, {"error": {"message": f"model not found: {mid}", "type": "invalid_request"}})
         elif path in ("/health", "/v1/health", "/"):
             self._json(200, {"ok": True, "model": OPENCODE_MODEL, "mode": "opencode-serve", "serve": SERVE_URL,
-                             "models": _fetch_models(),
+                             "models": _ranked_models(),
+                             "fallback_models": _fallback_chain(MODEL_ID)[:8],
+                             "fallback_enabled": SHIM_MODEL_FALLBACK,
                              "attachments_supported": ["image", "pdf", "text/*"],
                              "attachments_converted": ["any UTF-8 text (json, csv, code, ...) -> text/plain part"],
                              "attachments_staged": ["other binary (zip, apk, tar, ...) -> tool-readable path in WORKDIR inbox"],
