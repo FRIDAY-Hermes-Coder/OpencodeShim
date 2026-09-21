@@ -37,20 +37,42 @@ OPENCODE_MODEL = SHIM_OPENCODE_MODEL
 _model_resolution_cache = {}
 def _resolve_model(req_model):
     """Map a client-requested model name to an available opencode model.
-    Returns the modelID to use for the opencode request body."""
-    if not req_model or req_model == MODEL_ID:
-        return SHIM_OPENCODE_MODEL
-    # If the requested model is in our discovered list, use it directly.
-    # Otherwise fall back to SHIM_OPENCODE_MODEL.
-    available = _fetch_models()
-    avail_ids = {m["id"] for m in available}
-    if req_model in avail_ids:
-        return req_model
-    # Try mapping via provider/modelID convention: "provider/model"
+
+    Returns the modelID (short, without provider prefix) to use for the
+    opencode request body's modelID field. Provider is always derived as
+    ``opencode`` or the prefix before ``/`` if present.
+    """
+    if not req_model:
+        # Use configured default (strip provider prefix if present).
+        return SHIM_OPENCODE_MODEL.split("/")[-1] if "/" in SHIM_OPENCODE_MODEL else SHIM_OPENCODE_MODEL
+    # If client asks for the configured SHORT id, map to its opencode model.
+    if req_model == MODEL_ID:
+        return SHIM_OPENCODE_MODEL.split("/")[-1] if "/" in SHIM_OPENCODE_MODEL else SHIM_OPENCODE_MODEL
+    # Check discovered list — handle both "provider/model" and short names.
+    try:
+        available = _fetch_models()
+    except Exception:
+        available = []
+    # Build lookup for both full and short forms.
+    short_to_full = {}
+    full_ids = set()
     for m in available:
-        if m["id"] == req_model:
-            return req_model
-    return SHIM_OPENCODE_MODEL
+        fid = m.get("id", "")
+        full_ids.add(fid)
+        if "/" in fid:
+            short_to_full[fid.split("/")[-1]] = fid
+        short_to_full[fid] = fid
+    if req_model in full_ids:
+        return req_model.split("/")[-1] if "/" in req_model else req_model
+    if req_model in short_to_full:
+        fid = short_to_full[req_model]
+        return fid.split("/")[-1] if "/" in fid else fid
+    # Suffix match (e.g. client sends short, available is provider/short)
+    for fid in full_ids:
+        if fid.endswith("/" + req_model) or fid == req_model:
+            return fid.split("/")[-1] if "/" in fid else fid
+    # Unknown model — fall back to default rather than failing the turn.
+    return SHIM_OPENCODE_MODEL.split("/")[-1] if "/" in SHIM_OPENCODE_MODEL else SHIM_OPENCODE_MODEL
 OPENCODE_BIN = os.environ.get("SHIM_OPENCODE_BIN", "/home/mitansh/.opencode/bin/opencode")
 SERVE_URL = os.environ.get("SHIM_SERVE_URL", "http://127.0.0.1:4096").rstrip("/")
 WORKDIR = os.environ.get("SHIM_WORKDIR", "/home/mitansh/hermesworkspace")
@@ -709,13 +731,14 @@ def _do_session_turn(handler, t0, req_id, messages, tools, tool_choice,
 
     def _run_once(exec_sid, exec_prompt, exec_parts):
         """One turn via event relay; blocking fallback only if async never started."""
-        body = {"model": {"providerID": "opencode", "modelID": MODEL_ID},
+        resolved = _resolve_model(req_model)
+        body = {"model": {"providerID": "opencode", "modelID": resolved},
                 "parts": [{"type": "text", "text": exec_prompt}] + list(exec_parts or [])}
         if agent:
             body["agent"] = agent
         ok_r, text_r, err_r, meta_r = _relay_turn(
             exec_sid, body, TIMEOUT,
-            on_delta=_emit_live if stream else None)
+            on_delta=(_emit_live if (stream and not tools) else None))
         if ok_r:
             return True, text_r, "", meta_r, True
         # Fallback: blocking call only when prompt_async never started the turn
@@ -984,16 +1007,19 @@ def _do_session_turn(handler, t0, req_id, messages, tools, tool_choice,
     _log_req_line(entry)
 
     if stream_live and not calls:
+        def _flat(s):
+            return re.sub(r"\s+", "", s or "")
         streamed = relay_meta.get("streamed_text", "")
         final_text = out or ""
         if not streamed and final_text.strip():
             _emit_live(final_text)
             print(f"[stream] catch-up: 0 live chunks, sent {len(final_text)} reconciled chars")
-        elif streamed and final_text.startswith(streamed) and len(final_text) > len(streamed):
-            tail = final_text[len(streamed):]
-            if tail.strip():
-                _emit_live(tail)
-                print(f"[stream] catch-up: tail of {len(tail)} chars not covered by live deltas")
+        elif streamed and _flat(final_text) != _flat(streamed):
+            # Separator/whitespace differences make exact tail-diffing unreliable
+            # across multiple parts. Occasional visible duplication is far safer
+            # than a silently dropped tail.
+            _emit_live(("\n\n" if streamed.strip() else "") + final_text)
+            print(f"[stream] catch-up: flat mismatch, resent {len(final_text)} reconciled chars (streamed {len(streamed)})")
 
     if stream_live:
         # Headers sent before the turn; text deltas already forwarded live.
