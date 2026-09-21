@@ -30,7 +30,27 @@ import sessions as L1
 HOST = os.environ.get("SHIM_HOST", "127.0.0.1")
 PORT = int(os.environ.get("SHIM_PORT", "8000"))
 MODEL_ID = os.environ.get("SHIM_MODEL_ID", "muse-spark-1.3-contributor-free")
-OPENCODE_MODEL = os.environ.get("SHIM_OPENCODE_MODEL", "opencode/muse-spark-1.3-contributor-free")
+SHIM_OPENCODE_MODEL = os.environ.get("SHIM_OPENCODE_MODEL", "opencode/muse-spark-1.3-contributor-free")
+OPENCODE_MODEL = SHIM_OPENCODE_MODEL
+
+# Dynamic model resolution: resolve client-requested model to an opencode model.
+_model_resolution_cache = {}
+def _resolve_model(req_model):
+    """Map a client-requested model name to an available opencode model.
+    Returns the modelID to use for the opencode request body."""
+    if not req_model or req_model == MODEL_ID:
+        return SHIM_OPENCODE_MODEL
+    # If the requested model is in our discovered list, use it directly.
+    # Otherwise fall back to SHIM_OPENCODE_MODEL.
+    available = _fetch_models()
+    avail_ids = {m["id"] for m in available}
+    if req_model in avail_ids:
+        return req_model
+    # Try mapping via provider/modelID convention: "provider/model"
+    for m in available:
+        if m["id"] == req_model:
+            return req_model
+    return SHIM_OPENCODE_MODEL
 OPENCODE_BIN = os.environ.get("SHIM_OPENCODE_BIN", "/home/mitansh/.opencode/bin/opencode")
 SERVE_URL = os.environ.get("SHIM_SERVE_URL", "http://127.0.0.1:4096").rstrip("/")
 WORKDIR = os.environ.get("SHIM_WORKDIR", "/home/mitansh/hermesworkspace")
@@ -48,6 +68,9 @@ SHIM_MAX_SESSIONS = int(os.environ.get("SHIM_MAX_SESSIONS", "200"))
 SHIM_SESSION_TTL = int(os.environ.get("SHIM_SESSION_TTL", str(7 * 24 * 3600)))
 SHIM_IDEMPOTENT_TTL = int(os.environ.get("SHIM_IDEMPOTENT_TTL", "60"))
 SHIM_SESSION_LOCK_TIMEOUT = int(os.environ.get("SHIM_SESSION_LOCK_TIMEOUT", "300"))
+SHIM_MODELS_CACHE_TTL = int(os.environ.get("SHIM_MODELS_CACHE_TTL", "300"))  # seconds
+_models_cache = {"models": [], "updated": 0}
+_models_cache_lock = threading.Lock()
 # --- Phase 2 profiles (§3 plan_enhanced.md) ---
 SHIM_AGENT_LLM = os.environ.get("SHIM_AGENT_LLM", "hermes")       # Profile A: plain model
 SHIM_AGENT_TASK = os.environ.get("SHIM_AGENT_TASK", "hermes-agent")  # Profile B: agentic worker
@@ -219,7 +242,8 @@ def _run_session_turn(sid, prompt, file_parts, agent=None):
     if not ok:
         return False, "", f"opencode serve down ({health}). Check `systemctl --user status opencode-serve`."
     parts = [{"type": "text", "text": prompt}] + list(file_parts or [])
-    body = {"model": {"providerID": "opencode", "modelID": MODEL_ID},
+    resolved_model = _resolve_model(MODEL_ID)
+    body = {"model": {"providerID": "opencode", "modelID": resolved_model},
             "parts": parts}
     if agent:
         body["agent"] = agent
@@ -248,6 +272,7 @@ def _run_session_turn(sid, prompt, file_parts, agent=None):
 # --- Phase 3 streaming relay (§4 plan_enhanced.md) ---
 SHIM_IDLE_TIMEOUT = int(os.environ.get("SHIM_IDLE_TIMEOUT", "120"))  # s since last event
 SHIM_HEARTBEAT = int(os.environ.get("SHIM_HEARTBEAT", "10"))  # SSE ping interval (stream path)
+SHIM_NARRATE_TOOLS = os.environ.get("SHIM_NARRATE_TOOLS", "0") == "1"
 
 
 def _prompt_async(sid, body):
@@ -328,13 +353,14 @@ def _relay_turn(sid, msg_body, wall_timeout, on_delta=None, should_stop=None):
     """
     import queue as _queue
     t_start = time.time()
-    meta = {"ttfb_ms": 0, "usage": None, "events": 0, "streamed_chunks": 0}
+    meta = {"ttfb_ms": 0, "usage": None, "events": 0, "streamed_chunks": 0, "streamed_text": ""}
     q = _queue.Queue()
     stop_flag = threading.Event()
     sub = threading.Thread(target=_event_subscriber, args=(stop_flag, q), daemon=True)
     sub.start()
     # Connect the subscriber before prompt_async so early events aren't missed.
     time.sleep(0.5)
+    last_part_id = None
     ok, err = _prompt_async(sid, msg_body)
     if not ok:
         stop_flag.set()
@@ -369,14 +395,30 @@ def _relay_turn(sid, msg_body, wall_timeout, on_delta=None, should_stop=None):
                     if ttfb is None:
                         ttfb = now
                         meta["ttfb_ms"] = int((ttfb - t_start) * 1000)
+                    part_id = props.get("partID") or (props.get("part") or {}).get("id")
+                    if part_id and part_id != last_part_id and meta["streamed_text"] and not meta["streamed_text"].endswith("\n"):
+                        sep = "\n\n"
+                        if on_delta:
+                            on_delta(sep)
+                        meta["streamed_text"] += sep
+                    last_part_id = part_id
                     if on_delta:
                         try:
                             on_delta(d)
                             meta["streamed_chunks"] += 1
+                            meta["streamed_text"] += d
                         except Exception:
                             fatal = "client disconnected"
                             break
                     last_forward = now
+            elif etype == "message.part.updated":
+                part = props.get("part") or {}
+                if SHIM_NARRATE_TOOLS and part.get("type") == "tool" and part.get("state", {}).get("status") == "completed":
+                    tool_name = part.get("tool") or "tool"
+                    summary = f"\n\u2699 {tool_name}\n"
+                    if on_delta:
+                        on_delta(summary)
+                    meta["streamed_text"] += summary
             elif etype == "session.idle":
                 break  # success; reconcile below
             elif etype == "session.error":
@@ -417,6 +459,15 @@ def _relay_turn(sid, msg_body, wall_timeout, on_delta=None, should_stop=None):
             meta["usage"] = {"prompt_tokens": int(toks.get("input") or 0),
                              "completion_tokens": int(toks.get("output") or 0),
                              "total_tokens": int(toks.get("input") or 0) + int(toks.get("output") or 0)}
+        if not meta["usage"]:
+            print(f"[usage-debug] {json.dumps(last_m.get('info', {}))[:1000]}")
+            all_text = sum(len(p.get("text", "")) for m in msgs for p in m.get("parts", [])
+                           if p.get("type") == "text")
+            est_total = max(1, all_text // 4)
+            meta["usage"] = {"prompt_tokens": est_total,
+                             "completion_tokens": max(1, len(full) // 4),
+                             "total_tokens": est_total + max(1, len(full) // 4),
+                             "estimated": True}
         return True, full, "", meta
     except Exception as e:
         return False, "", f"reconcile failed: {e}", meta
@@ -432,6 +483,42 @@ def _openai_tool_calls(calls):
             "function": {"name": c["name"], "arguments": json.dumps(c["arguments"])},
         })
     return tcs
+
+
+def _fetch_models():
+    """Discover available models from opencode serve. Returns list of model dicts."""
+    global _models_cache
+    now = time.time()
+    with _models_cache_lock:
+        if _models_cache["models"] and (now - _models_cache["updated"] < SHIM_MODELS_CACHE_TTL):
+            return _models_cache["models"]
+    ok, resp = _serve_call("GET", "/global/models", timeout=10)
+    if not ok:
+        # Fallback: try /global/health to check serve is up, then return default
+        return [{"id": MODEL_ID, "object": "model",
+                 "created": int(time.time()), "owned_by": "opencode-shim"}]
+    if isinstance(resp, dict):
+        models = resp.get("models") or resp.get("data") or resp.get("models")
+        if isinstance(models, list) and models:
+            normalized = []
+            for m in models:
+                if isinstance(m, dict):
+                    mid = m.get("id") or m.get("modelID") or m.get("name")
+                    if mid:
+                        normalized.append({
+                            "id": str(mid),
+                            "object": "model",
+                            "created": m.get("created", int(time.time())),
+                            "owned_by": m.get("owned_by", "opencode"),
+                        })
+            if normalized:
+                with _models_cache_lock:
+                    _models_cache["models"] = normalized
+                    _models_cache["updated"] = now
+                return normalized
+    # Serve returned something unexpected; use the configured model as fallback
+    return [{"id": MODEL_ID, "object": "model",
+             "created": int(time.time()), "owned_by": "opencode-shim"}]
 # --- Phase 0 observability (§7 plan_enhanced.md): structured req log + debug ---
 SHIM_DEBUG_DUMP = os.environ.get("SHIM_DEBUG_DUMP", "0") == "1"
 _SHIM_START = time.time()
@@ -598,13 +685,16 @@ def _do_session_turn(handler, t0, req_id, messages, tools, tool_choice,
     stream_created = int(time.time()) if stream else None
     stream_live = False
     stream_first = True
-    relay_meta = {"ttfb_ms": 0, "usage": None, "events": 0, "streamed_chunks": 0}
+    relay_meta = {"ttfb_ms": 0, "usage": None, "events": 0, "streamed_chunks": 0, "streamed_text": ""}
 
     def _emit_live(text):
         """Write one OpenAI chunk (or heartbeat ping when text is None)."""
         nonlocal stream_first
         if text is None:
-            handler.wfile.write(b": ping\n\n")
+            chunk = {"id": stream_cid, "object": "chat.completion.chunk",
+                     "created": stream_created, "model": req_model,
+                     "choices": [{"index": 0, "delta": {}, "finish_reason": None}]}
+            handler.wfile.write(f"data: {json.dumps(chunk)}\n\n".encode())
             handler.wfile.flush()
             return
         chunk = {"id": stream_cid, "object": "chat.completion.chunk",
@@ -658,6 +748,7 @@ def _do_session_turn(handler, t0, req_id, messages, tools, tool_choice,
                 handler._cors()
                 handler.end_headers()
                 stream_live = True
+                _emit_live("")  # zero-width role-delta, satisfies TTFB instantly
             except (BrokenPipeError, ConnectionResetError):
                 slock.release()
                 entry = {"id": req_id, "sess": sid[:14], "session_id": sid,
@@ -822,6 +913,39 @@ def _do_session_turn(handler, t0, req_id, messages, tools, tool_choice,
         elif fence == "text" and must_call:
             fence = "failed"
 
+    if not calls and not (out or "").strip() and SHIM_REPAIR_TURNS > 0:
+        print(f"[repair] {sid[:14]} empty completion, no tool call - nudging once")
+        nudge = ("[system] Your previous turn produced no visible output. "
+                 "Respond now - either plain text, or a ```hermes-toolcalls "
+                 "block if a tool call is needed.")
+        ok_n, out_n, err_n = False, "", ""
+        if _sem.acquire(blocking=True, timeout=60):
+            try:
+                slock_n = L1.session_lock(sid)
+                if slock_n.acquire(blocking=True, timeout=60):
+                    try:
+                        ok_n, out_n, err_n, meta_n, _ = _run_once(sid, nudge, [])
+                        relay_meta.update({k: v for k, v in meta_n.items() if v and k != "ttfb_ms"})
+                    finally:
+                        slock_n.release()
+            finally:
+                _sem.release()
+        if ok_n and out_n.strip():
+            out = raw_out = out_n
+            fence = "repaired-empty"
+            if tools and tool_choice != "none":
+                try:
+                    calls2, remaining2, _ = parse_fence(out, tools, forced_name)
+                    if calls2:
+                        calls, out = calls2, remaining2
+                        tcs = _openai_tool_calls(calls)
+                        store.note_tool_calls(sid, {tc["id"]: tc["function"]["name"] for tc in tcs})
+                except Exception:
+                    pass
+        else:
+            fail(502, "opencode produced no output for this turn, even after a nudge", "502", "backend_error")
+            return
+
     # Register: new session -> full chain; then pre-register chain+reply.
     if first_dump:
         store.register_new(chain, sid, _system_raw_of(messages),
@@ -858,6 +982,18 @@ def _do_session_turn(handler, t0, req_id, messages, tools, tool_choice,
              "ttfb_ms": relay_meta.get("ttfb_ms", 0),
              "total_ms": total_ms, "finish": "tool_calls" if calls else "stop"}
     _log_req_line(entry)
+
+    if stream_live and not calls:
+        streamed = relay_meta.get("streamed_text", "")
+        final_text = out or ""
+        if not streamed and final_text.strip():
+            _emit_live(final_text)
+            print(f"[stream] catch-up: 0 live chunks, sent {len(final_text)} reconciled chars")
+        elif streamed and final_text.startswith(streamed) and len(final_text) > len(streamed):
+            tail = final_text[len(streamed):]
+            if tail.strip():
+                _emit_live(tail)
+                print(f"[stream] catch-up: tail of {len(tail)} chars not covered by live deltas")
 
     if stream_live:
         # Headers sent before the turn; text deltas already forwarded live.
@@ -1678,9 +1814,10 @@ def run_opencode(prompt, images=None, file_parts=None):
         return False, "", f"session create failed: {sess}"
     sid = sess["id"]
     try:
+        resolved_model = _resolve_model(MODEL_ID)
         ok, resp = _serve_call(
             "POST", f"/session/{sid}/message",
-            {"model": {"providerID": "opencode", "modelID": MODEL_ID},
+            {"model": {"providerID": "opencode", "modelID": resolved_model},
              "parts": parts},
             timeout=TIMEOUT,
         )
@@ -1845,18 +1982,26 @@ class Handler(BaseHTTPRequestHandler):
         from urllib.parse import unquote
         path = urlparse(self.path).path.rstrip("/") or "/"
         if path in ("/v1/models", "/models"):
+            models = _fetch_models()
             self._json(200, {
                 "object": "list",
-                "data": [self._model_object()],
+                "data": models,
             })
         elif path in ("/v1/models/" + MODEL_ID, "/models/" + MODEL_ID):
             self._json(200, self._model_object())
         elif path.startswith(("/v1/models/", "/models/")):
-            # OpenAI-compatible retrieve: unknown ids 404 like the real API.
+            # OpenAI-compatible retrieve: check discovered models, 404 like the real API if unknown.
             mid = unquote(path.rsplit("/", 1)[-1])
-            self._json(404, {"error": {"message": f"model not found: {mid}", "type": "invalid_request"}})
+            models = _fetch_models()
+            model_ids = {m["id"] for m in models}
+            if mid in model_ids:
+                self._json(200, {"id": mid, "object": "model",
+                                  "created": int(time.time()), "owned_by": "opencode-shim"})
+            else:
+                self._json(404, {"error": {"message": f"model not found: {mid}", "type": "invalid_request"}})
         elif path in ("/health", "/v1/health", "/"):
             self._json(200, {"ok": True, "model": OPENCODE_MODEL, "mode": "opencode-serve", "serve": SERVE_URL,
+                             "models": _fetch_models(),
                              "attachments_supported": ["image", "pdf", "text/*"],
                              "attachments_converted": ["any UTF-8 text (json, csv, code, ...) -> text/plain part"],
                              "attachments_staged": ["other binary (zip, apk, tar, ...) -> tool-readable path in WORKDIR inbox"],
