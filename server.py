@@ -91,6 +91,7 @@ SHIM_SESSION_TTL = int(os.environ.get("SHIM_SESSION_TTL", str(7 * 24 * 3600)))
 SHIM_IDEMPOTENT_TTL = int(os.environ.get("SHIM_IDEMPOTENT_TTL", "60"))
 SHIM_SESSION_LOCK_TIMEOUT = int(os.environ.get("SHIM_SESSION_LOCK_TIMEOUT", "300"))
 SHIM_MODELS_CACHE_TTL = int(os.environ.get("SHIM_MODELS_CACHE_TTL", "300"))  # seconds
+SHIM_SESSION_MAX_TURNS = int(os.environ.get("SHIM_SESSION_MAX_TURNS", "80"))
 _models_cache = {"models": [], "updated": 0}
 _models_cache_lock = threading.Lock()
 SHIM_MODEL_FALLBACK = os.environ.get("SHIM_MODEL_FALLBACK", "1") == "1"
@@ -262,6 +263,34 @@ def select_profile(tools, header_override=None, model=None):
 
 def profile_agent(profile):
     return SHIM_AGENT_LLM if profile == "A" else SHIM_AGENT_TASK
+
+
+def _make_session_carryover(messages, rec):
+    """One-paragraph carryover for proactive max-turns fork.
+
+    Keeps recent context so new session does not lose recall, without relying
+    on opencode's own compaction which silently truncates.
+    """
+    turns = rec.get("turns", 0)
+    idx = rec.get("idx", 0)
+    # recent messages compact rendering
+    recent = messages[-12:] if len(messages) > 12 else messages
+    lines = []
+    for m in recent:
+        if not isinstance(m, dict):
+            continue
+        role = (m.get("role") or "user")
+        txt, _ = extract_text_and_images(m.get("content"))
+        txt = (txt or "").strip().replace("\n", " ")
+        if not txt:
+            continue
+        # keep per-message truncated to avoid bloat
+        lines.append(f"{role[:4]}: {txt[:300]}")
+    body = " | ".join(lines[-6:]) if lines else "(no recent text)"
+    return (f"[system carryover: prior session {idx+1} msgs / {turns} turns "
+            f"exceeded SHIM_SESSION_MAX_TURNS={SHIM_SESSION_MAX_TURNS}. "
+            f"Forked to new session to avoid opencode compaction. "
+            f"Recent context (truncated, last {len(lines)} msgs): {body[:2000]}]")
 
 
 def build_tools_compact(tools, tool_choice):
@@ -452,7 +481,7 @@ def _relay_turn(sid, msg_body, wall_timeout, on_delta=None, should_stop=None):
     """
     import queue as _queue
     t_start = time.time()
-    meta = {"ttfb_ms": 0, "usage": None, "events": 0, "streamed_chunks": 0, "streamed_text": ""}
+    meta = {"ttfb_ms": 0, "usage": None, "events": 0, "streamed_chunks": 0, "streamed_text": "", "displayed_text": ""}
     q = _queue.Queue()
     stop_flag = threading.Event()
     sub = threading.Thread(target=_event_subscriber, args=(stop_flag, q), daemon=True)
@@ -500,12 +529,14 @@ def _relay_turn(sid, msg_body, wall_timeout, on_delta=None, should_stop=None):
                         if on_delta:
                             on_delta(sep)
                         meta["streamed_text"] += sep
+                        meta["displayed_text"] += sep
                     last_part_id = part_id
                     if on_delta:
                         try:
                             on_delta(d)
                             meta["streamed_chunks"] += 1
                             meta["streamed_text"] += d
+                            meta["displayed_text"] += d
                         except Exception:
                             fatal = "client disconnected"
                             break
@@ -517,7 +548,7 @@ def _relay_turn(sid, msg_body, wall_timeout, on_delta=None, should_stop=None):
                     summary = f"\n\u2699 {tool_name}\n"
                     if on_delta:
                         on_delta(summary)
-                    meta["streamed_text"] += summary
+                    meta["displayed_text"] += summary
             elif etype == "session.idle":
                 break  # success; reconcile below
             elif etype == "session.error":
@@ -559,6 +590,8 @@ def _relay_turn(sid, msg_body, wall_timeout, on_delta=None, should_stop=None):
                              "completion_tokens": int(toks.get("output") or 0),
                              "total_tokens": int(toks.get("input") or 0) + int(toks.get("output") or 0)}
         if not meta["usage"]:
+            with _stats_lock:
+                _stats["usage_estimated"] += 1
             print(f"[usage-debug] {json.dumps(last_m.get('info', {}))[:1000]}")
             all_text = sum(len(p.get("text", "")) for m in msgs for p in m.get("parts", [])
                            if p.get("type") == "text")
@@ -633,6 +666,11 @@ _stats = {
     "total_ms": collections.deque(maxlen=200),
     "prompt_bytes": collections.deque(maxlen=200),
     "errors": 0,
+    "catchup_fires": 0,
+    "empty_nudges": 0,
+    "usage_estimated": 0,
+    "forks_max_turns": 0,
+    "zen_429": 0,
 }
 _stats_lock = threading.Lock()
 
@@ -669,6 +707,24 @@ def _do_session_turn(handler, t0, req_id, messages, tools, tool_choice,
     delta = resolution["delta"]
     profile = select_profile(tools, profile_override, req_model)
     agent = profile_agent(profile)
+    # --- Session length cap (§10): proactive fork before opencode compaction ---
+    carryover = None
+    if hit and not forked and sid:
+        try:
+            info = store.session_info(sid)
+        except Exception:
+            info = None
+        if info and info.get("turns", 0) >= SHIM_SESSION_MAX_TURNS:
+            carryover = _make_session_carryover(messages, info)
+            print(f"[sessions] {sid[:14]} at {info['turns']} turns >= max {SHIM_SESSION_MAX_TURNS}, forking with carryover")
+            with _stats_lock:
+                _stats["forks_max_turns"] += 1
+            forked, fork_reason = True, f"max_turns {info['turns']}>={SHIM_SESSION_MAX_TURNS}"
+            # inject carryover as sys_update so it reaches the model
+            sys_update = (sys_update + "\n\n" + carryover) if sys_update else carryover
+            # force new session; keep original messages for chain but mark miss
+            sid, hit = None, False
+            delta = list(messages)
     new_tools_hash = _tools_hash(tools) if tools else ""
     new_tool_names = _offered_names(tools) if tools else []
     tools_sent = 0
@@ -733,8 +789,12 @@ def _do_session_turn(handler, t0, req_id, messages, tools, tool_choice,
             tools_section = ""
         prompt, atts_raw = _build_delta_prompt(delta, sid, sys_update, tools_section)
         first_dump = False
+        if carryover and carryover not in prompt:
+            prompt = carryover + "\n\n" + prompt
     else:
         prompt, atts_raw = messages_to_prompt(messages, tools, tool_choice)
+        if carryover and carryover not in prompt:
+            prompt = carryover + "\n\n" + prompt
         tools_sent = n_tools
         first_dump = True
 
@@ -787,7 +847,7 @@ def _do_session_turn(handler, t0, req_id, messages, tools, tool_choice,
     stream_created = int(time.time()) if stream else None
     stream_live = False
     stream_first = True
-    relay_meta = {"ttfb_ms": 0, "usage": None, "events": 0, "streamed_chunks": 0, "streamed_text": ""}
+    relay_meta = {"ttfb_ms": 0, "usage": None, "events": 0, "streamed_chunks": 0, "streamed_text": "", "displayed_text": ""}
 
     def _emit_live(text):
         """Write one OpenAI chunk (or heartbeat ping when text is None)."""
@@ -934,10 +994,22 @@ def _do_session_turn(handler, t0, req_id, messages, tools, tool_choice,
 
     if not ok:
         msg = err or "opencode run failed"
-        if "auth" in msg.lower() or "401" in msg or "unauthorized" in msg or "api key" in msg.lower():
+        # Distinct Zen-side 429 (rate limit) — before generic 401/500 collapse
+        _low = (err or "").lower()
+        is_429 = ("429" in (err or "")) or any(kw in _low for kw in ["rate limit", "quota", "too many requests", "overloaded", "capacity"])
+        # Also check structured error in msg if present
+        if not is_429 and "429" in msg:
+            is_429 = True
+        if is_429:
+            with _stats_lock:
+                _stats["zen_429"] += 1
+            msg += "\n\nZen backend rate-limited (429). Back off with jitter and retry; do not hammer."
+            status = 429
+        elif "auth" in msg.lower() or "401" in msg or "unauthorized" in msg or "api key" in msg.lower():
             msg += ("\n\nHint: one-time setup needed: run `opencode auth login` -> OpenCode Zen "
                     "(free, no card at opencode.ai/auth), then retry. Hermes side stays keyless.")
-        if "inactivity timeout" in err or "wall timeout" in err:
+            status = 401
+        elif "inactivity timeout" in err or "wall timeout" in err:
             status = 504
         else:
             status = 401 if "401" in err or "unauthorized" in err.lower() else 500
@@ -1041,6 +1113,8 @@ def _do_session_turn(handler, t0, req_id, messages, tools, tool_choice,
             fence = "failed"
 
     if not calls and not (out or "").strip() and SHIM_REPAIR_TURNS > 0:
+        with _stats_lock:
+            _stats["empty_nudges"] += 1
         print(f"[repair] {sid[:14]} empty completion, no tool call - nudging once")
         nudge = ("[system] Your previous turn produced no visible output. "
                  "Respond now - either plain text, or a ```hermes-toolcalls "
@@ -1114,16 +1188,23 @@ def _do_session_turn(handler, t0, req_id, messages, tools, tool_choice,
         def _flat(s):
             return re.sub(r"\s+", "", s or "")
         streamed = relay_meta.get("streamed_text", "")
+        displayed = relay_meta.get("displayed_text", "")
         final_text = out or ""
         if not streamed and final_text.strip():
             _emit_live(final_text)
+            with _stats_lock:
+                _stats["catchup_fires"] += 1
             print(f"[stream] catch-up: 0 live chunks, sent {len(final_text)} reconciled chars")
         elif streamed and _flat(final_text) != _flat(streamed):
             # Separator/whitespace differences make exact tail-diffing unreliable
             # across multiple parts. Occasional visible duplication is far safer
-            # than a silently dropped tail.
+            # than a silently dropped tail. Compare against streamed_text (model-only),
+            # not displayed_text (which includes narrated tool lines), so narrations
+            # do not trigger spurious resends.
             _emit_live(("\n\n" if streamed.strip() else "") + final_text)
-            print(f"[stream] catch-up: flat mismatch, resent {len(final_text)} reconciled chars (streamed {len(streamed)})")
+            with _stats_lock:
+                _stats["catchup_fires"] += 1
+            print(f"[stream] catch-up: flat mismatch, resent {len(final_text)} reconciled chars (streamed {len(streamed)} displayed {len(displayed)})")
 
     if stream_live:
         # Headers sent before the turn; text deltas already forwarded live.
@@ -2178,10 +2259,21 @@ class Handler(BaseHTTPRequestHandler):
                        "tool_calls_total": _stats["tool_calls_total"],
                        "p50_total_ms": _percentile(totals, 50), "p95_total_ms": _percentile(totals, 95),
                        "mean_prompt_bytes": (sum(pbytes) // len(pbytes)) if pbytes else 0,
-                       "uptime_s": int(time.time() - _SHIM_START)}
+                       "uptime_s": int(time.time() - _SHIM_START),
+                       "catchup_fires": _stats.get("catchup_fires", 0),
+                       "empty_nudges": _stats.get("empty_nudges", 0),
+                       "usage_estimated": _stats.get("usage_estimated", 0),
+                       "forks_max_turns": _stats.get("forks_max_turns", 0),
+                       "zen_429": _stats.get("zen_429", 0)}
                 ftot = _stats["fence_ok"] + _stats["fence_repaired"] + _stats["fence_failed"]
                 obj["fence_ok_rate"] = round(
                     (_stats["fence_ok"] + _stats["fence_repaired"]) / ftot, 4) if ftot else 1.0
+                # percentages for observability
+                if obj["requests"]:
+                    obj["catchup_pct"] = round(obj["catchup_fires"] / obj["requests"], 4)
+                    obj["empty_nudge_pct"] = round(obj["empty_nudges"] / obj["requests"], 4)
+                    _est = obj["usage_estimated"]
+                    obj["usage_estimated_pct"] = round(_est / obj["requests"], 4)
             self._json(200, obj)
         else:
             self._json(404, {"error": {"message": f"not found: {path}", "type": "not_found"}})
@@ -2302,11 +2394,18 @@ class Handler(BaseHTTPRequestHandler):
 
         if not ok:
             msg = err or "opencode run failed"
-            # Friendly hint for missing Zen auth (opencode stores it separately; shim stays keyless)
-            if "auth" in msg.lower() or "401" in msg or "unauthorized" in msg or "api key" in msg.lower():
+            _low2 = (err or "").lower()
+            if "429" in (err or "") or any(kw in _low2 for kw in ["rate limit", "quota", "too many requests", "overloaded", "capacity"]):
+                with _stats_lock:
+                    _stats["zen_429"] += 1
+                msg += "\n\nZen backend rate-limited (429). Back off with jitter and retry."
+                status = 429
+            elif "auth" in msg.lower() or "401" in msg or "unauthorized" in msg or "api key" in msg.lower():
                 msg += ("\n\nHint: one-time setup needed: run `opencode auth login` -> OpenCode Zen "
                         "(free, no card at opencode.ai/auth), then retry. Hermes side stays keyless.")
-            status = 401 if "401" in err or "unauthorized" in err.lower() else 500
+                status = 401
+            else:
+                status = 401 if "401" in err or "unauthorized" in err.lower() else 500
             total_ms = int((time.time() - t0) * 1000)
             entry = {"id": req_id, "sess": "-", "hit": 0, "depth": n_msgs,
                      "delta_msgs": n_msgs, "delta_bytes": prompt_bytes,

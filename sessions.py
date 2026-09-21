@@ -245,6 +245,13 @@ class SessionStore:
             gone = set(dead)
             self.index = {h: e for h, e in self.index.items()
                           if e.get("session_id") not in gone}
+            # Prune locks for TTL-expired sessions
+            try:
+                with _session_locks_guard:
+                    for sid in list(dead):
+                        _session_locks.pop(sid, None)
+            except Exception:
+                pass
         # LRU cap
         if len(self.sessions) > self.max_sessions:
             ordered = sorted(self.sessions.items(), key=lambda kv: kv[1].get("last_used", 0))
@@ -253,6 +260,17 @@ class SessionStore:
             alive = set(self.sessions)
             self.index = {h: e for h, e in self.index.items()
                           if e.get("session_id") in alive}
+        # Prune orphaned per-session locks for evicted sessions (fix #3)
+        try:
+            with _session_locks_guard:
+                for sid in list(_session_locks.keys()):
+                    if sid not in self.sessions:
+                        try:
+                            del _session_locks[sid]
+                        except KeyError:
+                            pass
+        except Exception:
+            pass
 
     def resolve(self, messages):
         """Longest-prefix match. Returns dict with session_id|None, delta, meta.
