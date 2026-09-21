@@ -364,13 +364,14 @@ def _build_delta_prompt(delta, session_id, system_update, tools_section):
     return prompt, atts
 
 
-def _run_session_turn(sid, prompt, file_parts, agent=None):
+def _run_session_turn(sid, prompt, file_parts, agent=None, model_override=None):
     """POST one turn to an existing opencode session (no create/delete)."""
     ok, health = _serve_call("GET", "/global/health", timeout=15)
     if not ok:
         return False, "", f"opencode serve down ({health}). Check `systemctl --user status opencode-serve`."
     parts = [{"type": "text", "text": prompt}] + list(file_parts or [])
-    resolved_model = _resolve_model(MODEL_ID)
+    _eff = model_override if model_override is not None else MODEL_ID
+    resolved_model = _resolve_model(_eff)
     body = {"model": {"providerID": "opencode", "modelID": resolved_model},
             "parts": parts}
     if agent:
@@ -869,7 +870,7 @@ def _do_session_turn(handler, t0, req_id, messages, tools, tool_choice,
         handler.wfile.flush()
         stream_first = False
 
-    def _run_once(exec_sid, exec_prompt, exec_parts, model_override=None):
+    def _run_once(exec_sid, exec_prompt, exec_parts, model_override=None, wall_timeout=None):
         """One turn via event relay; blocking fallback only if async never started."""
         _eff_model = model_override if model_override is not None else req_model
         resolved = _resolve_model(_eff_model)
@@ -877,15 +878,16 @@ def _do_session_turn(handler, t0, req_id, messages, tools, tool_choice,
                 "parts": [{"type": "text", "text": exec_prompt}] + list(exec_parts or [])}
         if agent:
             body["agent"] = agent
+        _wt = wall_timeout if wall_timeout is not None else TIMEOUT
         ok_r, text_r, err_r, meta_r = _relay_turn(
-            exec_sid, body, TIMEOUT,
+            exec_sid, body, _wt,
             on_delta=(_emit_live if (stream and not tools) else None))
         if ok_r:
             return True, text_r, "", meta_r, True
         # Fallback: blocking call only when prompt_async never started the turn
         # (anything later may already be running server-side — never double-run).
         if err_r.startswith("prompt_async"):
-            ok_b, text_b, err_b = _run_session_turn(exec_sid, exec_prompt, exec_parts, agent)
+            ok_b, text_b, err_b = _run_session_turn(exec_sid, exec_prompt, exec_parts, agent, model_override=model_override)
             return ok_b, text_b, err_b, meta_r, False
         return False, "", err_r, meta_r, True
 
@@ -928,6 +930,8 @@ def _do_session_turn(handler, t0, req_id, messages, tools, tool_choice,
                 return
         try:
             # Fallback chain: all discovered models, most powerful first, requested first.
+            # Cumulative deadline so 4×120s does not stall 8 min on total failure (fix design gap).
+            _fallback_deadline = time.time() + TIMEOUT
             _chain = _fallback_chain(req_model) if SHIM_MODEL_FALLBACK else [req_model or MODEL_ID]
             _chain = _chain[: SHIM_MODEL_FALLBACK_RETRIES + 1]
             ok = False; out = ""; err = "no attempt"; meta_got = {}; used_relay = True
@@ -936,7 +940,12 @@ def _do_session_turn(handler, t0, req_id, messages, tools, tool_choice,
                 _active_try_model = _try_model
                 if _try_idx > 0:
                     print(f"[fallback] model {req_model} -> {_try_model} after: {err[:120]}")
-                ok, out, err, meta_got, used_relay = _run_once(sid, prompt, file_parts, model_override=_try_model)
+                _remaining = _fallback_deadline - time.time()
+                if _remaining <= 5:
+                    print(f"[fallback] overall budget exhausted at attempt {_try_idx+1}/{len(_chain)}")
+                    err = f"fallback budget exhausted after {_try_idx} attempts"
+                    break
+                ok, out, err, meta_got, used_relay = _run_once(sid, prompt, file_parts, model_override=_try_model, wall_timeout=_remaining)
                 # _relay_turn may return None meta on failure; guard it
                 if isinstance(meta_got, dict):
                     relay_meta.update({k: v for k, v in meta_got.items() if v is not None})
@@ -973,7 +982,10 @@ def _do_session_turn(handler, t0, req_id, messages, tools, tool_choice,
                     fp2, fn2 = prepare_file_inputs(normed2)
                     if fn2:
                         prompt2 += "\n\n" + "\n".join(fn2)
-                    ok, out, err, meta_got2, used_relay2 = _run_once(sid, prompt2, fp2, model_override=_active_try_model)
+                    _remaining2 = _fallback_deadline - time.time()
+                    if _remaining2 <= 5:
+                        _remaining2 = 5
+                    ok, out, err, meta_got2, used_relay2 = _run_once(sid, prompt2, fp2, model_override=_active_try_model, wall_timeout=_remaining2)
                     relay_meta.update(meta_got2)
                     if not used_relay2:
                         stream_live = False
@@ -1164,6 +1176,8 @@ def _do_session_turn(handler, t0, req_id, messages, tools, tool_choice,
 
     total_ms = int((time.time() - t0) * 1000)
     usage = relay_meta.get("usage")
+    # Preserve fallback-served model for debugging (ignored by OpenAI clients)
+    _served = locals().get("_active_try_model") or req_model
     if calls:
         resp = chat_completion_tool_response(req_model, remaining or None, calls, tcs=tcs,
                                              cid=stream_cid, created=stream_created,
@@ -1172,6 +1186,12 @@ def _do_session_turn(handler, t0, req_id, messages, tools, tool_choice,
         resp = chat_completion_response(req_model, out,
                                         cid=stream_cid, created=stream_created,
                                         usage=usage)
+    # Harmless extra field so quality complaints can be traced to fallback model
+    try:
+        if _served and _served != req_model:
+            resp["x_shim_served_model"] = _served
+    except Exception:
+        pass
     store.store_idempotent(full_hash, {"resp": resp, "tool": bool(calls)})
     entry = {"id": req_id, "sess": sid[:14], "session_id": sid,
              "hit": hit, "depth": n_msgs - 1,
