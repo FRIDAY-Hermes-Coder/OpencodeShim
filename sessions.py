@@ -124,7 +124,11 @@ def canon(m):
     content = m.get("content")
     # o1-and-newer clients may send role "developer" instead of "system"
     # (§B.2) — normalize it the same way so volatile content hashes stable.
-    if role in ("system", "developer") and isinstance(content, str):
+    # The role string itself is normalized too: system and developer with
+    # identical content must hash identically, otherwise the drift/carryover
+    # mechanism silently stops applying and every turn forks.
+    canon_role = "system" if role == "developer" else role
+    if canon_role == "system" and isinstance(content, str):
         content = norm_system(content)
     else:
         content = norm_content(content)
@@ -136,7 +140,7 @@ def canon(m):
         tcs.append([str(fn.get("name", "")), _norm_args(fn.get("arguments", ""))])
     tcs.sort()
     return json.dumps({
-        "role": role,
+        "role": canon_role,
         "content": content,
         "name": m.get("name"),
         "tool_call_id": m.get("tool_call_id"),

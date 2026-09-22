@@ -216,13 +216,18 @@ def _response_format_instruction(rf):
 
 
 def _validate_json_schema(obj, schema, _path="$"):
-    """Subset JSON Schema validator (§A.6, json_schema mode).
+    """JSON Schema validator (§A.6, json_schema mode) — full conformance for
+    the keywords OpenAI structured-output schemas actually use.
 
-    Supports: type (object/array/string/number/integer/boolean/null),
-    required, properties (recursive), additionalProperties (bool),
-    items (single schema), enum, const. Unknown keywords are ignored.
-    Returns (ok, err).
+    Supports: type, const, enum, required, properties (recursive),
+    additionalProperties (bool or schema), items (single schema),
+    min/maxLength, pattern, minimum/maximum, exclusiveMinimum/Maximum,
+    multipleOf, min/maxItems, uniqueItems, min/maxProperties,
+    anyOf/oneOf/allOf/not. Unknown keywords ($ref, format, if/then/else,
+    propertyNames, etc.) are ignored. Returns (ok, err).
     """
+    if isinstance(schema, bool):
+        return (True, None) if schema else (False, f"{_path}: schema is false")
     if not isinstance(schema, dict):
         return True, None
     if "const" in schema:
@@ -234,6 +239,36 @@ def _validate_json_schema(obj, schema, _path="$"):
                 return False, f"{_path}: value not in enum"
         except Exception:
             return False, f"{_path}: value not in enum"
+    # Combinators first so type errors inside them report precisely.
+    if isinstance(schema.get("anyOf"), list):
+        _errs = []
+        for _sub in schema["anyOf"]:
+            _ok, _e = _validate_json_schema(obj, _sub, _path)
+            if _ok:
+                break
+            _errs.append(_e)
+        else:
+            return False, f"{_path}: does not match anyOf ({(_errs[0] if _errs else 'no match')})"
+    if isinstance(schema.get("oneOf"), list):
+        _n = 0
+        _last = None
+        for _sub in schema["oneOf"]:
+            _ok, _e = _validate_json_schema(obj, _sub, _path)
+            if _ok:
+                _n += 1
+            else:
+                _last = _e
+        if _n != 1:
+            return False, f"{_path}: must match exactly one of oneOf (matched {_n}){(': ' + str(_last)) if _last and _n == 0 else ''}"
+    if isinstance(schema.get("allOf"), list):
+        for _sub in schema["allOf"]:
+            _ok, _e = _validate_json_schema(obj, _sub, _path)
+            if not _ok:
+                return False, _e
+    if isinstance(schema.get("not"), dict):
+        _ok, _ = _validate_json_schema(obj, schema["not"], _path)
+        if _ok:
+            return False, f"{_path}: matches forbidden schema 'not'"
     t = schema.get("type")
     if t is not None:
         _types = [t] if isinstance(t, str) else (t if isinstance(t, list) else None)
@@ -256,6 +291,42 @@ def _validate_json_schema(obj, schema, _path="$"):
                     _ok = True
             if not _ok:
                 return False, f"{_path}: expected type {_types}, got {type(obj).__name__}"
+    if isinstance(obj, str):
+        _minl = schema.get("minLength")
+        if isinstance(_minl, int) and not isinstance(_minl, bool) and len(obj) < _minl:
+            return False, f"{_path}: shorter than minLength {_minl}"
+        _maxl = schema.get("maxLength")
+        if isinstance(_maxl, int) and not isinstance(_maxl, bool) and len(obj) > _maxl:
+            return False, f"{_path}: longer than maxLength {_maxl}"
+        _pat = schema.get("pattern")
+        if isinstance(_pat, str) and _pat:
+            try:
+                if not re.search(_pat, obj):
+                    return False, f"{_path}: does not match pattern"
+            except Exception:
+                pass
+    if isinstance(obj, (int, float)) and not isinstance(obj, bool):
+        for _k, _cmp, _lbl in (("minimum", lambda a, b: a < b, "less than minimum"),
+                               ("maximum", lambda a, b: a > b, "greater than maximum")):
+            _lim = schema.get(_k)
+            if isinstance(_lim, (int, float)) and not isinstance(_lim, bool) and _cmp(obj, _lim):
+                return False, f"{_path}: {_lbl} {_lim}"
+        _exmin = schema.get("exclusiveMinimum")
+        if isinstance(_exmin, (int, float)) and not isinstance(_exmin, bool) and obj <= _exmin:
+            return False, f"{_path}: not greater than exclusiveMinimum {_exmin}"
+        _exmax = schema.get("exclusiveMaximum")
+        if isinstance(_exmax, (int, float)) and not isinstance(_exmax, bool) and obj >= _exmax:
+            return False, f"{_path}: not less than exclusiveMaximum {_exmax}"
+        _mult = schema.get("multipleOf")
+        if isinstance(_mult, (int, float)) and not isinstance(_mult, bool) and _mult > 0:
+            try:
+                _q = obj / _mult
+                if abs(_q - round(_q)) > 1e-9:
+                    return False, f"{_path}: not a multiple of {_mult}"
+            except Exception:
+                pass
+    # Note: draft-04 exclusiveMinimum/Maximum as booleans (modifying
+    # minimum/maximum) are not used by OpenAI structured outputs; ignored.
     if isinstance(obj, dict):
         for _k in schema.get("required") or []:
             if isinstance(_k, str) and _k not in obj:
@@ -267,15 +338,45 @@ def _validate_json_schema(obj, schema, _path="$"):
                     _ok, _e = _validate_json_schema(obj[_k], _sub, f"{_path}.{_k}")
                     if not _ok:
                         return False, _e
-        if schema.get("additionalProperties") is False and isinstance(_props, dict):
+        _minp = schema.get("minProperties")
+        if isinstance(_minp, int) and not isinstance(_minp, bool) and len(obj) < _minp:
+            return False, f"{_path}: fewer properties than minProperties {_minp}"
+        _maxp = schema.get("maxProperties")
+        if isinstance(_maxp, int) and not isinstance(_maxp, bool) and len(obj) > _maxp:
+            return False, f"{_path}: more properties than maxProperties {_maxp}"
+        _ap = schema.get("additionalProperties")
+        if isinstance(_props, dict):
             _extra = [k for k in obj if k not in _props]
             if _extra:
-                return False, f"{_path}: additional properties not allowed: {sorted(_extra)[:5]}"
-    if isinstance(obj, list) and isinstance(schema.get("items"), dict):
-        for _i, _item in enumerate(obj):
-            _ok, _e = _validate_json_schema(_item, schema["items"], f"{_path}[{_i}]")
-            if not _ok:
-                return False, _e
+                if _ap is False:
+                    return False, f"{_path}: additional properties not allowed: {sorted(_extra)[:5]}"
+                if isinstance(_ap, dict):
+                    for _k in _extra:
+                        _ok, _e = _validate_json_schema(obj[_k], _ap, f"{_path}.{_k}")
+                        if not _ok:
+                            return False, _e
+    if isinstance(obj, list):
+        _mini = schema.get("minItems")
+        if isinstance(_mini, int) and not isinstance(_mini, bool) and len(obj) < _mini:
+            return False, f"{_path}: fewer items than minItems {_mini}"
+        _maxi = schema.get("maxItems")
+        if isinstance(_maxi, int) and not isinstance(_maxi, bool) and len(obj) > _maxi:
+            return False, f"{_path}: more items than maxItems {_maxi}"
+        if schema.get("uniqueItems") is True and len(obj) > 1:
+            try:
+                _seen = set()
+                for _it in obj:
+                    _key = json.dumps(_it, sort_keys=True, separators=(",", ":")) if isinstance(_it, (dict, list)) else repr(_it)
+                    if _key in _seen:
+                        return False, f"{_path}: duplicate items but uniqueItems is true"
+                    _seen.add(_key)
+            except Exception:
+                pass
+        if isinstance(schema.get("items"), dict):
+            for _i, _item in enumerate(obj):
+                _ok, _e = _validate_json_schema(_item, schema["items"], f"{_path}[{_i}]")
+                if not _ok:
+                    return False, _e
     return True, None
 
 
@@ -2954,16 +3055,46 @@ class Handler(BaseHTTPRequestHandler):
             out = remaining
             fence = "text"
 
-        # response_format in flatten mode (no session for a repair turn):
-        # prompt instruction was already injected. If the output still does
-        # not validate, fail loudly (502) rather than shipping malformed
-        # JSON as a "successful" 200 (§A.6).
-        if response_format and not calls:
+        # response_format in flatten mode: prompt instruction was already
+        # injected. Mirror the session path — one repair turn, then loud 502
+        # (§A.6). No session to reuse here, so the repair re-runs with the
+        # original prompt plus the prior output for context.
+        if response_format and not calls and SHIM_REPAIR_TURNS > 0:
             _rf_ok, _rf_err = _validate_response_format(out, response_format)
+            if not _rf_ok:
+                print(f"[response_format] flat-path repair turn: {(_rf_err or '')[:200]}")
+                _rf_repair_prompt = (
+                    prompt + "\n\n[system] Your last response was not valid JSON"
+                    + (f" ({_rf_err})" if _rf_err else "")
+                    + f". Your previous response was:\n{(out or '')[:4000]}\n"
+                    + "Reply with only the corrected JSON, nothing else.")
+                _rf_ok_r, _rf_out_r, _rf_err_r = False, "", ""
+                if _sem.acquire(blocking=True, timeout=60):
+                    try:
+                        _rf_ok_r, _rf_out_r, _rf_err_r = run_opencode(
+                            _rf_repair_prompt, file_parts=file_parts,
+                            serve_format=serve_format)
+                    finally:
+                        _sem.release()
+                else:
+                    _rf_ok_r, _rf_out_r, _rf_err_r = False, "", "repair slot busy"
+                if _rf_ok_r and (_rf_out_r or "").strip():
+                    _rf_ok2, _rf_err2 = _validate_response_format(_rf_out_r, response_format)
+                    if _rf_ok2:
+                        out = _rf_out_r
+                        fence = "repaired-json"
+                        _rf_ok, _rf_err = True, None
+                    else:
+                        _rf_err = _rf_err2
+                        _rf_ok = False
+                else:
+                    _rf_ok = False
+                    _rf_err = _rf_err_r or _rf_err
             if not _rf_ok:
                 _fail(502, ("response_format could not be satisfied: model did not "
                             f"produce valid JSON ({(_rf_err or 'unknown')[:300]})"),
                       "502")
+                return
         _flat_out, _ = _apply_stop(out or "", stop)
         _flat_out, _flat_hit_max = _apply_max_tokens(_flat_out, max_tokens)
         out = _flat_out
