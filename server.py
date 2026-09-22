@@ -192,6 +192,49 @@ def _apply_max_tokens(text, limit, chars_per_token=4):
     return text[:budget], True
 
 
+def _make_gated_delta(inner_emit, stop, max_tokens):
+    """Stream live as normal; stop forwarding (but let the turn finish
+    server-side for correct reconciliation) only once a stop-sequence or
+    the token budget is actually hit — instead of buffering the whole
+    turn just because these params were set."""
+    state = {"buf": "", "cut": False, "sent": 0}
+    seqs = ([stop] if isinstance(stop, str) else list(stop or [])) if stop else []
+    budget_chars = None  # same ~4 chars/token heuristic as _apply_max_tokens
+    if max_tokens:
+        try:
+            _n = int(max_tokens)
+        except Exception:
+            _n = None
+        if _n and _n > 0:
+            budget_chars = _n * 4
+    def gated(d):
+        if d is None:                       # heartbeat — always pass through
+            if inner_emit:
+                inner_emit(None)
+            return
+        if state["cut"]:
+            return
+        state["buf"] += d
+        cut_at = None
+        for s in seqs:
+            i = state["buf"].find(s)
+            if i != -1 and (cut_at is None or i < cut_at):
+                cut_at = i
+        limit = cut_at if cut_at is not None else (
+            budget_chars if budget_chars and len(state["buf"]) >= budget_chars else None)
+        if limit is not None:
+            visible = state["buf"][:limit]
+            tail = visible[state["sent"]:]
+            if tail and inner_emit:
+                inner_emit(tail)
+            state["cut"] = True
+            return
+        if inner_emit:
+            inner_emit(d)
+        state["sent"] += len(d)
+    return gated
+
+
 def _response_format_instruction(rf):
     """Prompt instruction enforcing response_format (§A.6). Returns "" if none."""
     if not isinstance(rf, dict):
@@ -1220,13 +1263,18 @@ def _do_session_turn(handler, t0, req_id, messages, tools, tool_choice,
         if serve_format is not None:
             body["format"] = serve_format
         _wt = wall_timeout if wall_timeout is not None else TIMEOUT
-        # When stop/max_tokens/response_format is active the final text is
-        # post-processed (truncated / validated) — buffer instead of streaming
-        # live so the client never sees the pre-truncation bytes (§A.1).
-        _buffered = bool(stop or max_tokens or response_format)
+        # stop/max_tokens no longer force whole-turn buffering: the gated
+        # wrapper below forwards live and only stops once a cutoff actually
+        # fires. Only response_format still buffers (prompt-injection +
+        # repair-turn design can't un-send bytes).
+        _needs_full_buffer = bool(response_format)   # only json-mode still buffers whole-turn
+        on_delta = None
+        if stream and not tools and not _needs_full_buffer:
+            on_delta = (_make_gated_delta(_emit_live, stop, max_tokens)
+                        if (stop or max_tokens) else _emit_live)
         ok_r, text_r, err_r, meta_r = _relay_turn(
             exec_sid, body, _wt,
-            on_delta=(_emit_live if (stream and not tools and not _buffered) else None))
+            on_delta=on_delta)
         if ok_r:
             return True, text_r, "", meta_r, True
         # Fallback: blocking call only when prompt_async never started the turn
