@@ -1524,6 +1524,27 @@ def _do_session_turn(handler, t0, req_id, messages, tools, tool_choice,
             out = remaining
         elif fence == "text" and must_call:
             fence = "failed"
+        elif fence == "failed":
+            # A real tool-call attempt was made (valid JSON syntax, invalid shape)
+            # and the repair turn didn't fix it either. This is not a legitimate
+            # plain-text answer — regardless of tool_choice, don't let a failed
+            # protocol attempt leak to the user as prose. Fail loudly instead,
+            # same pattern as the exhausted empty-completion guard.
+            _msg502 = (f"model produced an invalid tool call and the repair attempt "
+                       f"also failed: {ferr}")
+            if stream_live:
+                try:
+                    err_chunk = {"id": stream_cid, "object": "chat.completion.chunk",
+                                 "created": stream_created, "model": req_model,
+                                 "choices": [{"index": 0, "delta": {},
+                                              "finish_reason": "stop",
+                                              "error": _msg502[:500]}]}
+                    handler.wfile.write(f"data: {json.dumps(err_chunk)}\n\ndata: [DONE]\n\n".encode())
+                except (BrokenPipeError, ConnectionResetError):
+                    pass
+                return
+            fail(502, _msg502, "502", "backend_error")
+            return
 
     if not calls and not (out or "").strip() and SHIM_REPAIR_TURNS > 0:
         with _stats_lock:
@@ -2307,6 +2328,8 @@ def build_tools_instruction(tools, tool_choice):
         "Rules: use only these tool names: " + ", ".join(names[:100]) + ". "
         "Arguments must be a single JSON object matching that tool's parameters schema "
         "(use {} if it takes none). No prose outside the fence when calling tools. "
+        "For tools taking large content or body arguments (e.g. file writes), emit one call per turn "
+        "rather than batching several large calls into one array. "
         "To answer directly instead, output plain text with no fence.]\n"
         "Tool definitions: " + full
     )
