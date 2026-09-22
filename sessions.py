@@ -302,9 +302,10 @@ class SessionStore:
                         "forked": True,
                         "fork_reason": f"divergence depth={hit_idx} session_idx={rec.get('idx')}",
                         "sys_drift": False, "system_update": ""}
-            # System drift check (messages[0] is system by convention)
+            # System drift check (messages[0] is system by convention;
+            # o1-and-newer clients may send role "developer" instead — §B.2)
             sys_drift, sys_update = False, ""
-            if messages and isinstance(messages[0], dict) and messages[0].get("role") == "system":
+            if messages and isinstance(messages[0], dict) and messages[0].get("role") in ("system", "developer"):
                 raw = messages[0].get("content")
                 raw = raw if isinstance(raw, str) else json.dumps(raw or "")
                 live = hashlib.sha256(raw.encode()).hexdigest()

@@ -97,6 +97,126 @@ _models_cache_lock = threading.Lock()
 SHIM_MODEL_FALLBACK = os.environ.get("SHIM_MODEL_FALLBACK", "1") == "1"
 SHIM_MODEL_FALLBACK_RETRIES = int(os.environ.get("SHIM_MODEL_FALLBACK_RETRIES", "3"))
 
+# --- OpenAI compat (PLAN v5) ---
+# Error type alignment (§E): OpenAI uses the `_error`-suffixed values. The
+# shim historically emitted bare names; map centrally so new code can pass
+# either form.
+_TYPE_MAP = {"invalid_request": "invalid_request_error",
+             "not_found": "not_found_error",
+             "backend_error": "api_error",
+             "rate_limit": "rate_limit_error"}
+
+
+def _openai_error(message, etype="invalid_request", param=None, code=None):
+    """Build an OpenAI-shaped {"error": {...}} body with aligned type + param/code."""
+    t = _TYPE_MAP.get(etype, etype)
+    err = {"message": str(message)[:4000], "type": t}
+    if param is not None:
+        err["param"] = param
+    if code is not None:
+        err["code"] = code
+    return {"error": err}
+
+
+# Params the opencode/Zen backend cannot provide through the session
+# abstraction (token-level logprobs / sampling control). Requesting them is
+# a loud 400, never a silent ignore (§A.7).
+_UNSUPPORTED_PARAMS = ("logprobs", "top_logprobs", "seed", "logit_bias")
+
+
+def _apply_stop(text, stop):
+    """Truncate text at the first occurrence of any stop sequence (§A.1)."""
+    if not stop or not text:
+        return text, False
+    seqs = [stop] if isinstance(stop, str) else list(stop or [])
+    cut_at = None
+    for s in seqs:
+        if s and isinstance(s, str):
+            i = text.find(s)
+            if i != -1 and (cut_at is None or i < cut_at):
+                cut_at = i
+    if cut_at is None:
+        return text, False
+    return text[:cut_at], True
+
+
+def _apply_max_tokens(text, limit, chars_per_token=4):
+    """Post-hoc token-budget cap (§A.2). Estimate via ~4 chars/token, same
+    heuristic as the Bug-E usage fallback. Returns (text, truncated)."""
+    if not limit or not text:
+        return text, False
+    try:
+        n = int(limit)
+    except Exception:
+        return text, False
+    if n <= 0:
+        return text, False
+    budget = n * chars_per_token
+    if len(text) <= budget:
+        return text, False
+    return text[:budget], True
+
+
+def _response_format_instruction(rf):
+    """Prompt instruction enforcing response_format (§A.6). Returns "" if none."""
+    if not isinstance(rf, dict):
+        return ""
+    t = rf.get("type")
+    if t == "json_object":
+        return ("\n\n[Response format: respond with a single valid JSON object "
+                "and nothing else. No prose, no fences, no commentary.]")
+    if t == "json_schema":
+        js = rf.get("json_schema") or {}
+        name = js.get("name") if isinstance(js, dict) else None
+        schema = (js.get("schema") if isinstance(js, dict) else None) or rf.get("schema")
+        try:
+            schema_s = json.dumps(schema)[:4000] if schema is not None else ""
+        except Exception:
+            schema_s = str(schema)[:4000] if schema is not None else ""
+        nm = f" named '{name}'" if name else ""
+        return ("\n\n[Response format: respond with a single valid JSON value"
+                f"{nm} conforming strictly to this JSON Schema and nothing else: "
+                f"{schema_s}. No prose, no fences, no commentary.]")
+    return ""
+
+
+def _validate_response_format(text, rf):
+    """Check reconciled text against response_format. Returns (ok, err)."""
+    if not isinstance(rf, dict):
+        return True, None
+    t = rf.get("type")
+    if t not in ("json_object", "json_schema"):
+        return True, None
+    try:
+        obj = json.loads(text or "")
+    except Exception as e:
+        return False, f"response is not valid JSON ({e})"
+    if t == "json_schema":
+        js = rf.get("json_schema") or {}
+        schema = (js.get("schema") if isinstance(js, dict) else None) or rf.get("schema")
+        if isinstance(schema, dict):
+            req = schema.get("required")
+            if isinstance(req, list) and isinstance(obj, dict):
+                missing = [k for k in req if isinstance(k, str) and k not in obj]
+                if missing:
+                    return False, f"response JSON missing required key(s): {', '.join(missing)}"
+    return True, None
+
+
+def _serve_format_for_response_format(rf):
+    """Native opencode `format` body for response_format (§A.6) — DISABLED.
+
+    Probed 2026-09-22 against serve 1.18.31: a format-bearing
+    POST /session/:id/prompt_async returns 204 and the turn runs, but the
+    very next GET /session/:id/message (the reconciliation step every turn
+    depends on) fails 400 "Expected OutputFormatJsonSchema, got {...}".
+    So native format breaks 100% of turns that use it. This stays a
+    single kill-switch returning None — prompt-injection + repair-turn is
+    the sole enforcement path until a fixed serve version is confirmed
+    with the same direct probe. Re-enable by restoring the json_schema
+    passthrough below."""
+    return None
+
 # Power ranking — most powerful first. Clients see this order in /v1/models.
 # Override via SHIM_MODEL_ORDER="model-a,model-b,..." (comma-separated, case-insensitive substrings).
 _MODEL_POWER_ORDER = [s.strip().lower() for s in os.environ.get("SHIM_MODEL_ORDER", "").split(",") if s.strip()] or [
@@ -192,7 +312,7 @@ def get_store():
 
 
 def _system_raw_of(messages):
-    if messages and isinstance(messages[0], dict) and messages[0].get("role") == "system":
+    if messages and isinstance(messages[0], dict) and messages[0].get("role") in ("system", "developer"):
         c = messages[0].get("content")
         return c if isinstance(c, str) else json.dumps(c or "")
     return ""
@@ -364,7 +484,8 @@ def _build_delta_prompt(delta, session_id, system_update, tools_section):
     return prompt, atts
 
 
-def _run_session_turn(sid, prompt, file_parts, agent=None, model_override=None):
+def _run_session_turn(sid, prompt, file_parts, agent=None, model_override=None,
+                      serve_format=None):
     """POST one turn to an existing opencode session (no create/delete)."""
     ok, health = _serve_call("GET", "/global/health", timeout=15)
     if not ok:
@@ -376,6 +497,8 @@ def _run_session_turn(sid, prompt, file_parts, agent=None, model_override=None):
             "parts": parts}
     if agent:
         body["agent"] = agent
+    if serve_format is not None:
+        body["format"] = serve_format
     ok, resp = _serve_call(
         "POST", f"/session/{sid}/message", body,
         timeout=TIMEOUT,
@@ -690,10 +813,14 @@ def _log_req_line(entry):
 
 
 def _do_session_turn(handler, t0, req_id, messages, tools, tool_choice,
-                     stream, req_model, n_msgs, n_tools, profile_override=None):
+                     stream, req_model, n_msgs, n_tools, profile_override=None,
+                     stop=None, max_tokens=None, parallel_tool_calls=None,
+                     response_format=None, include_usage=False, serve_format=None):
     """L1 session path (§2): one Hermes conversation -> one opencode session.
 
     Sends only the delta (new turns). Miss/fork -> create + one full dump.
+    stop / max_tokens are applied post-hoc to the reconciled text (§A.1/A.2);
+    response_format is prompt-enforced with one repair turn (§A.6).
     """
     store = get_store()
     resolution = store.resolve(messages)
@@ -730,7 +857,7 @@ def _do_session_turn(handler, t0, req_id, messages, tools, tool_choice,
     new_tool_names = _offered_names(tools) if tools else []
     tools_sent = 0
 
-    def fail(code, msg, finish, ftype="invalid_request"):
+    def fail(code, msg, finish, ftype="invalid_request", param=None, code_slug=None):
         entry = {"id": req_id, "sess": (sid[:14] if sid else "-"), "session_id": sid or "-",
                  "hit": hit, "depth": n_msgs - 1,
                  "delta_msgs": len(delta), "delta_bytes": 0, "prompt_bytes": 0,
@@ -740,7 +867,7 @@ def _do_session_turn(handler, t0, req_id, messages, tools, tool_choice,
                  "fence": "-", "tool_calls": 0,
                  "total_ms": int((time.time() - t0) * 1000), "finish": finish}
         _log_req_line(entry)
-        handler._json(code, {"error": {"message": str(msg)[:2000], "type": ftype}})
+        handler._json(code, _openai_error(msg, ftype, param=param, code=code_slug))
 
     # Exact repeat within TTL -> cached response, no new turn ( Generale retry guard).
     cached = store.check_idempotent(full_hash, SHIM_IDEMPOTENT_TTL)
@@ -755,7 +882,7 @@ def _do_session_turn(handler, t0, req_id, messages, tools, tool_choice,
                  "total_ms": int((time.time() - t0) * 1000), "finish": "cached"}
         _log_req_line(entry)
         print(f"[idempotent] {req_id} served from cache")
-        _serve_cached(handler, cached, stream, req_model)
+        _serve_cached(handler, cached, stream, req_model, include_usage=include_usage)
         return
 
     # Empty delta on a hit = exact-duplicate of an earlier prefix (e.g. two
@@ -798,6 +925,15 @@ def _do_session_turn(handler, t0, req_id, messages, tools, tool_choice,
             prompt = carryover + "\n\n" + prompt
         tools_sent = n_tools
         first_dump = True
+
+    # response_format (§A.6): prompt-enforced JSON via existing repair-turn
+    # machinery. This is deliberately the SOLE enforcement path: native
+    # serve `format` is kill-switched (confirmed regression, see
+    # _serve_format_for_response_format), so there is no second machinery to
+    # conflict with. Coexists with tools by construction — validation is
+    # skipped for tool-call turns, where content is incidental.
+    if response_format:
+        prompt += _response_format_instruction(response_format)
 
     # Normalize attachments BEFORE acquiring any LLM slot (no hold during I/O).
     try:
@@ -878,16 +1014,23 @@ def _do_session_turn(handler, t0, req_id, messages, tools, tool_choice,
                 "parts": [{"type": "text", "text": exec_prompt}] + list(exec_parts or [])}
         if agent:
             body["agent"] = agent
+        if serve_format is not None:
+            body["format"] = serve_format
         _wt = wall_timeout if wall_timeout is not None else TIMEOUT
+        # When stop/max_tokens/response_format is active the final text is
+        # post-processed (truncated / validated) — buffer instead of streaming
+        # live so the client never sees the pre-truncation bytes (§A.1).
+        _buffered = bool(stop or max_tokens or response_format)
         ok_r, text_r, err_r, meta_r = _relay_turn(
             exec_sid, body, _wt,
-            on_delta=(_emit_live if (stream and not tools) else None))
+            on_delta=(_emit_live if (stream and not tools and not _buffered) else None))
         if ok_r:
             return True, text_r, "", meta_r, True
         # Fallback: blocking call only when prompt_async never started the turn
         # (anything later may already be running server-side — never double-run).
         if err_r.startswith("prompt_async"):
-            ok_b, text_b, err_b = _run_session_turn(exec_sid, exec_prompt, exec_parts, agent, model_override=model_override)
+            ok_b, text_b, err_b = _run_session_turn(exec_sid, exec_prompt, exec_parts, agent, model_override=model_override,
+                                                    serve_format=serve_format)
             return ok_b, text_b, err_b, meta_r, False
         return False, "", err_r, meta_r, True
 
@@ -1047,7 +1190,10 @@ def _do_session_turn(handler, t0, req_id, messages, tools, tool_choice,
             except (BrokenPipeError, ConnectionResetError):
                 pass
             return
-        handler._json(status, {"error": {"message": msg[:4000], "type": "backend_error", "output": out[:2000]}})
+        _etype = "rate_limit" if status == 429 else "backend_error"
+        _ebody = _openai_error(msg, _etype)
+        _ebody["error"]["output"] = out[:2000]
+        handler._json(status, _ebody)
         return
 
     # Fence protocol v2 (§3.3): parse, validate, one repair turn on failure.
@@ -1114,6 +1260,9 @@ def _do_session_turn(handler, t0, req_id, messages, tools, tool_choice,
             else:
                 fence = "failed"
                 print(f"[tools] repair turn failed: {err_r[:200]}")
+        if parallel_tool_calls is False and calls and len(calls) > 1:
+            # §A.4: client opted out of parallel calls — keep only the first.
+            calls = calls[:1]
         if calls:
             if fence == "text":
                 fence = "ok"
@@ -1150,6 +1299,8 @@ def _do_session_turn(handler, t0, req_id, messages, tools, tool_choice,
                 try:
                     calls2, remaining2, _ = parse_fence(out, tools, forced_name)
                     if calls2:
+                        if parallel_tool_calls is False and len(calls2) > 1:
+                            calls2 = calls2[:1]
                         calls, out = calls2, remaining2
                         tcs = _openai_tool_calls(calls)
                         store.note_tool_calls(sid, {tc["id"]: tc["function"]["name"] for tc in tcs})
@@ -1158,6 +1309,76 @@ def _do_session_turn(handler, t0, req_id, messages, tools, tool_choice,
         else:
             fail(502, "opencode produced no output for this turn, even after a nudge", "502", "backend_error")
             return
+
+    # response_format (§A.6): validate reconciled text; one repair turn on failure.
+    # Skipped for tool-call turns (content is incidental when tools fire).
+    if response_format and not calls and SHIM_REPAIR_TURNS > 0:
+        _rf_ok, _rf_err = _validate_response_format(out, response_format)
+        if not _rf_ok:
+            print(f"[response_format] repair turn: {_rf_err[:200]}")
+            _rf_prompt = ("[system] Your last response was not valid JSON"
+                          + (f" ({_rf_err})" if _rf_err else "")
+                          + ". Reply with only the corrected JSON, nothing else.")
+            _rf_ok_r, _rf_out_r, _rf_err_r = False, "", ""
+            if _sem.acquire(blocking=True, timeout=60):
+                try:
+                    _rf_lock = L1.session_lock(sid)
+                    if _rf_lock.acquire(blocking=True, timeout=60):
+                        try:
+                            _rf_ok_r, _rf_out_r, _rf_err_r, _rf_meta_r, _ = _run_once(sid, _rf_prompt, [])
+                            relay_meta.update({k: v for k, v in _rf_meta_r.items()
+                                               if v and k != "ttfb_ms"})
+                        finally:
+                            _rf_lock.release()
+                    else:
+                        _rf_ok_r, _rf_out_r, _rf_err_r = False, "", "repair lock busy"
+                finally:
+                    _sem.release()
+            else:
+                _rf_ok_r, _rf_out_r, _rf_err_r = False, "", "repair slot busy"
+            if _rf_ok_r and _rf_out_r.strip():
+                _rf_ok2, _rf_err2 = _validate_response_format(_rf_out_r, response_format)
+                if _rf_ok2:
+                    out = raw_out = _rf_out_r
+                    fence = "repaired-json"
+                else:
+                    _rf_err = _rf_err2
+                    _rf_ok = False
+            else:
+                _rf_ok = False
+                _rf_err = _rf_err_r or _rf_err
+            if not _rf_ok:
+                _msg502 = ("response_format could not be satisfied: model did not "
+                           f"produce valid JSON ({(_rf_err or 'unknown')[:300]})")
+                if stream_live:
+                    try:
+                        err_chunk = {"id": stream_cid, "object": "chat.completion.chunk",
+                                     "created": stream_created, "model": req_model,
+                                     "choices": [{"index": 0, "delta": {},
+                                                  "finish_reason": "stop",
+                                                  "error": _msg502[:500]}]}
+                        handler.wfile.write(f"data: {json.dumps(err_chunk)}\n\ndata: [DONE]\n\n".encode())
+                    except (BrokenPipeError, ConnectionResetError):
+                        pass
+                    return
+                fail(502, _msg502, "502", "backend_error")
+                return
+
+    # stop / max_tokens post-hoc shaping (§A.1/A.2) on the reconciled text.
+    _hit_max = False
+    if stop or max_tokens:
+        if calls:
+            _new_remaining, _ = _apply_stop(remaining or "", stop)
+            _new_remaining, _hit_max = _apply_max_tokens(_new_remaining, max_tokens)
+            remaining, out = _new_remaining, _new_remaining
+        else:
+            _new_out, _ = _apply_stop(out or "", stop)
+            _new_out, _hit_max = _apply_max_tokens(_new_out, max_tokens)
+            out = raw_out = _new_out
+    # A valid tool call always wins: "length" beside an executable tool_calls
+    # array is an ambiguous signal no client can act on. The cap still
+    # bounds the narration text above; only the label yields.
+    _finish = "tool_calls" if calls else ("length" if _hit_max else "stop")
 
     # Register: new session -> full chain; then pre-register chain+reply.
     if first_dump:
@@ -1181,11 +1402,11 @@ def _do_session_turn(handler, t0, req_id, messages, tools, tool_choice,
     if calls:
         resp = chat_completion_tool_response(req_model, remaining or None, calls, tcs=tcs,
                                              cid=stream_cid, created=stream_created,
-                                             usage=usage)
+                                             usage=usage, finish_reason=_finish)
     else:
         resp = chat_completion_response(req_model, out,
                                         cid=stream_cid, created=stream_created,
-                                        usage=usage)
+                                        usage=usage, finish_reason=_finish)
     # Harmless extra field so quality complaints can be traced to fallback model
     try:
         if _served and _served != req_model:
@@ -1199,9 +1420,9 @@ def _do_session_turn(handler, t0, req_id, messages, tools, tool_choice,
              "tools": n_tools, "tools_sent": tools_sent,
              "sys_drift": sys_drift, "forked": forked, "fork_reason": fork_reason,
              "profile": profile, "attach": len(normed), "stream": int(bool(stream)),
-             "fence": fence, "tool_calls": len(calls),
-             "ttfb_ms": relay_meta.get("ttfb_ms", 0),
-             "total_ms": total_ms, "finish": "tool_calls" if calls else "stop"}
+              "fence": fence, "tool_calls": len(calls),
+              "ttfb_ms": relay_meta.get("ttfb_ms", 0),
+              "total_ms": total_ms, "finish": _finish}
     _log_req_line(entry)
 
     if stream_live and not calls:
@@ -1232,12 +1453,17 @@ def _do_session_turn(handler, t0, req_id, messages, tools, tool_choice,
         cid, created = resp["id"], resp["created"]
         try:
             if calls:
-                _sse_send_tool_calls(handler, cid, created, req_model, None, calls, tcs=tcs)
+                _sse_send_tool_calls(handler, cid, created, req_model, None, calls, tcs=tcs,
+                                     finish_reason=_finish, usage=usage,
+                                     include_usage=include_usage)
             else:
                 done = {"id": cid, "object": "chat.completion.chunk", "created": created,
                         "model": req_model,
-                        "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}
-                handler.wfile.write(f"data: {json.dumps(done)}\n\ndata: [DONE]\n\n".encode())
+                        "choices": [{"index": 0, "delta": {}, "finish_reason": _finish}]}
+                handler.wfile.write(f"data: {json.dumps(done)}\n\n".encode())
+                if include_usage and usage is not None:
+                    _sse_send_usage_chunk(handler, cid, created, req_model, usage)
+                handler.wfile.write(b"data: [DONE]\n\n")
         except (BrokenPipeError, ConnectionResetError):
             pass
         return
@@ -1249,7 +1475,9 @@ def _do_session_turn(handler, t0, req_id, messages, tools, tool_choice,
         handler.send_header("Connection", "keep-alive")
         handler._cors()
         handler.end_headers()
-        _sse_send_tool_calls(handler, cid, created, req_model, remaining or None, calls, tcs=tcs)
+        _sse_send_tool_calls(handler, cid, created, req_model, remaining or None, calls, tcs=tcs,
+                             finish_reason=_finish, usage=usage,
+                             include_usage=include_usage)
         return
     if not calls and stream:
         cid, created = resp["id"], resp["created"]
@@ -1259,12 +1487,13 @@ def _do_session_turn(handler, t0, req_id, messages, tools, tool_choice,
         handler.send_header("Connection", "keep-alive")
         handler._cors()
         handler.end_headers()
-        _sse_send_text(handler, cid, created, req_model, out)
+        _sse_send_text(handler, cid, created, req_model, out, finish_reason=_finish,
+                       usage=usage, include_usage=include_usage)
         return
     handler._json(200, resp)
 
 
-def _serve_cached(self, cached, stream, req_model):
+def _serve_cached(self, cached, stream, req_model, include_usage=False):
     """Re-emit an idempotent-cached response in the requested format."""
     resp = cached["resp"]
     if not stream:
@@ -1277,13 +1506,19 @@ def _serve_cached(self, cached, stream, req_model):
     self.send_header("Connection", "keep-alive")
     self._cors()
     self.end_headers()
+    _finish = ((resp.get("choices") or [{}])[0] or {}).get("finish_reason") or "stop"
+    _usage = resp.get("usage")
     if cached.get("tool"):
         tcs = resp["choices"][0]["message"].get("tool_calls") or []
         content = resp["choices"][0]["message"].get("content")
-        _sse_send_tool_calls(self, cid, created, req_model, content, None, tcs=tcs)
+        _sse_send_tool_calls(self, cid, created, req_model, content, None, tcs=tcs,
+                             finish_reason=_finish, usage=_usage,
+                             include_usage=include_usage)
     else:
         _sse_send_text(self, cid, created, req_model,
-                       resp["choices"][0]["message"].get("content") or "")
+                       resp["choices"][0]["message"].get("content") or "",
+                       finish_reason=_finish, usage=_usage,
+                       include_usage=include_usage)
 
 
 def _redact_payload(prompt, file_parts):
@@ -1535,6 +1770,20 @@ def extract_text_and_images(content):
                 if url:
                     mime, fn = _guess_mime_and_name(url, default="audio/mpeg")
                     atts.append((mime, url, fn))
+            elif t == "input_audio":
+                # Genuine OpenAI shape: {"type":"input_audio","input_audio":{"data","format"}} (§B.1)
+                ia = p.get("input_audio") or {}
+                b64 = ia.get("data") if isinstance(ia, dict) else None
+                fmt = (ia.get("format") if isinstance(ia, dict) else None) or "wav"
+                if isinstance(b64, str) and b64:
+                    mime = f"audio/{fmt}"
+                    url = b64 if b64.startswith("data:") else f"data:{mime};base64,{b64}"
+                    atts.append((mime, url, None))
+            elif t == "refusal":
+                # Assistant refusal echoed back into history (§B.3) — keep as text.
+                v = p.get("refusal", "")
+                if isinstance(v, str) and v:
+                    texts.append(v)
             elif t in ("file", "document", "pdf"):
                 fobj = p.get("file", p)
                 url, fn = "", None
@@ -1547,6 +1796,9 @@ def extract_text_and_images(content):
                         b64 = fobj["data"]
                         mime0 = fobj.get("mime") or fobj.get("mime_type") or "application/pdf"
                         url = b64 if b64.startswith("data:") else f"data:{mime0};base64,{b64}"
+                if not url and isinstance(fobj, dict) and fobj.get("file_id"):
+                    # Files API reference with no inline data — unresolvable here (§B.4).
+                    print(f"[attach] file_id reference not resolvable by this shim: {fobj['file_id']}")
                 if url:
                     mime, fn2 = _guess_mime_and_name(url, default="application/pdf")
                     atts.append((mime, url, fn or fn2))
@@ -1811,7 +2063,7 @@ def _tool_spec(tools):
             name, params = t["name"], t.get("parameters") or {}
         else:
             continue
-        req = params.get("required") if isinstance(params, dict) else []
+        req = (params.get("required") if isinstance(params, dict) else []) or []
         props = params.get("properties") if isinstance(params, dict) else {}
         types = {k: (v.get("type") if isinstance(v, dict) else None)
                  for k, v in (props.items() if isinstance(props, dict) else [])}
@@ -2010,12 +2262,14 @@ def _serve_call(method, path, payload=None, timeout=30):
         return False, f"serve unreachable: {e}"
 
 
-def run_opencode(prompt, images=None, file_parts=None):
+def run_opencode(prompt, images=None, file_parts=None, serve_format=None):
     """Fast path: warm serve daemon (no subprocess cold boot).
 
     Preferred: pass ready serve file-parts via file_parts (see
     prepare_file_inputs()). Legacy: images as normalized
     [(mime, data_url, filename[, src_path])] tuples are converted here.
+    serve_format optionally carries opencode's native {"type":"json_schema",...}
+    OutputFormat for response_format (§A.6).
     """
     ok, health = _serve_call("GET", "/global/health", timeout=15)
     if not ok:
@@ -2046,10 +2300,13 @@ def run_opencode(prompt, images=None, file_parts=None):
     sid = sess["id"]
     try:
         resolved_model = _resolve_model(MODEL_ID)
+        _msg_body = {"model": {"providerID": "opencode", "modelID": resolved_model},
+                     "parts": parts}
+        if serve_format is not None:
+            _msg_body["format"] = serve_format
         ok, resp = _serve_call(
             "POST", f"/session/{sid}/message",
-            {"model": {"providerID": "opencode", "modelID": resolved_model},
-             "parts": parts},
+            _msg_body,
             timeout=TIMEOUT,
         )
         if not ok:
@@ -2093,7 +2350,7 @@ def run_opencode_subprocess(prompt):
 
 
 def chat_completion_tool_response(model, content, calls, tcs=None, cid=None,
-                                    created=None, usage=None):
+                                    created=None, usage=None, finish_reason="tool_calls"):
     if tcs is None:
         tcs = _openai_tool_calls(calls)
     return {
@@ -2105,14 +2362,23 @@ def chat_completion_tool_response(model, content, calls, tcs=None, cid=None,
             {
                 "index": 0,
                 "message": {"role": "assistant", "content": content, "tool_calls": tcs},
-                "finish_reason": "tool_calls",
+                "finish_reason": finish_reason,
+                "logprobs": None,
             }
         ],
         "usage": usage or {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
     }
 
 
-def _sse_send_tool_calls(self, cid, created, req_model, content, calls, tcs=None):
+def _sse_send_usage_chunk(self, cid, created, req_model, usage):
+    """Terminal usage-only chunk for stream_options.include_usage (§A.9)."""
+    usage_chunk = {"id": cid, "object": "chat.completion.chunk", "created": created,
+                   "model": req_model, "choices": [], "usage": usage}
+    self.wfile.write(f"data: {json.dumps(usage_chunk)}\n\n".encode())
+
+
+def _sse_send_tool_calls(self, cid, created, req_model, content, calls, tcs=None,
+                         finish_reason="tool_calls", usage=None, include_usage=False):
     """SSE variant for tool_calls responses (Hermes streams with stream:true)."""
     try:
         if tcs is None:
@@ -2136,13 +2402,17 @@ def _sse_send_tool_calls(self, cid, created, req_model, content, calls, tcs=None
         self.wfile.write(f"data: {json.dumps(chunk)}\n\n".encode())
         done = {"id": cid, "object": "chat.completion.chunk", "created": created,
                 "model": req_model,
-                "choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}]}
-        self.wfile.write(f"data: {json.dumps(done)}\n\ndata: [DONE]\n\n".encode())
+                "choices": [{"index": 0, "delta": {}, "finish_reason": finish_reason}]}
+        self.wfile.write(f"data: {json.dumps(done)}\n\n".encode())
+        if include_usage and usage is not None:
+            _sse_send_usage_chunk(self, cid, created, req_model, usage)
+        self.wfile.write(b"data: [DONE]\n\n")
     except (BrokenPipeError, ConnectionResetError):
         pass
 
 
-def _sse_send_text(self, cid, created, req_model, out):
+def _sse_send_text(self, cid, created, req_model, out, finish_reason="stop",
+                   usage=None, include_usage=False):
     try:
         chunk = {"id": cid, "object": "chat.completion.chunk", "created": created,
                  "model": req_model,
@@ -2150,13 +2420,17 @@ def _sse_send_text(self, cid, created, req_model, out):
         self.wfile.write(f"data: {json.dumps(chunk)}\n\n".encode())
         done = {"id": cid, "object": "chat.completion.chunk", "created": created,
                 "model": req_model,
-                "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}
-        self.wfile.write(f"data: {json.dumps(done)}\n\ndata: [DONE]\n\n".encode())
+                "choices": [{"index": 0, "delta": {}, "finish_reason": finish_reason}]}
+        self.wfile.write(f"data: {json.dumps(done)}\n\n".encode())
+        if include_usage and usage is not None:
+            _sse_send_usage_chunk(self, cid, created, req_model, usage)
+        self.wfile.write(b"data: [DONE]\n\n")
     except (BrokenPipeError, ConnectionResetError):
         pass
 
 
-def chat_completion_response(model, content, cid=None, created=None, usage=None):
+def chat_completion_response(model, content, cid=None, created=None, usage=None,
+                               finish_reason="stop"):
     return {
         "id": cid or f"chatcmpl-{uuid.uuid4().hex[:12]}",
         "object": "chat.completion",
@@ -2166,7 +2440,8 @@ def chat_completion_response(model, content, cid=None, created=None, usage=None)
             {
                 "index": 0,
                 "message": {"role": "assistant", "content": content},
-                "finish_reason": "stop",
+                "finish_reason": finish_reason,
+                "logprobs": None,
             }
         ],
         "usage": usage or {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
@@ -2237,7 +2512,8 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(200, {"id": lookup, "object": "model",
                                   "created": int(time.time()), "owned_by": "opencode-shim"})
             else:
-                self._json(404, {"error": {"message": f"model not found: {mid}", "type": "invalid_request"}})
+                self._json(404, _openai_error(f"model not found: {mid}", "invalid_request",
+                                              param="model", code="model_not_found"))
         elif path in ("/health", "/v1/health", "/"):
             self._json(200, {"ok": True, "model": OPENCODE_MODEL, "mode": "opencode-serve", "serve": SERVE_URL,
                              "models": _ranked_models(),
@@ -2296,12 +2572,12 @@ class Handler(BaseHTTPRequestHandler):
                     obj["usage_estimated_pct"] = round(_est / obj["requests"], 4)
             self._json(200, obj)
         else:
-            self._json(404, {"error": {"message": f"not found: {path}", "type": "not_found"}})
+            self._json(404, _openai_error(f"not found: {path}", "not_found"))
 
     def do_POST(self):
         path = urlparse(self.path).path.rstrip("/") or "/"
         if path not in ("/v1/chat/completions", "/chat/completions"):
-            self._json(404, {"error": {"message": f"not found: {path}", "type": "not_found"}})
+            self._json(404, _openai_error(f"not found: {path}", "not_found"))
             return
         t0 = time.time()
         req_id = f"r_{uuid.uuid4().hex[:6]}"
@@ -2313,16 +2589,68 @@ class Handler(BaseHTTPRequestHandler):
         try:
             body = json.loads(raw.decode() or "{}")
         except Exception:
-            self._json(400, {"error": {"message": "invalid JSON body", "type": "invalid_request"}})
+            self._json(400, _openai_error("invalid JSON body", "invalid_request"))
             return
 
+        # --- OpenAI compat guards (PLAN v5 Phase 1): fail fast, before any
+        # opencode call, so silent-wrongness becomes a loud 400. ---
+        _n = body.get("n", 1)
+        if isinstance(_n, int) and _n > 1:
+            self._json(400, _openai_error(
+                "n>1 is not supported by this shim (opencode serve produces one "
+                "completion per turn)", "invalid_request",
+                param="n", code="unsupported_parameter"))
+            return
+        for _p in _UNSUPPORTED_PARAMS:
+            if body.get(_p) is not None:
+                self._json(400, _openai_error(
+                    f"'{_p}' is not supported by this shim (opencode/Zen backend "
+                    "does not expose it)", "invalid_request",
+                    param=_p, code="unsupported_parameter"))
+                return
+
         messages = body.get("messages", [])
+        if not isinstance(messages, list) or len(messages) == 0:
+            self._json(400, _openai_error(
+                "messages array must not be empty", "invalid_request",
+                param="messages", code="empty_messages"))
+            return
         tools = body.get("tools")
         tool_choice = body.get("tool_choice")
+        # Legacy function-calling alias (§A.8): only when modern tools absent.
+        if not tools and body.get("functions"):
+            try:
+                tools = [{"type": "function", "function": f} for f in body["functions"]]
+                tool_choice = tool_choice or body.get("function_call")
+            except Exception:
+                pass
         stream = bool(body.get("stream"))
         req_model = body.get("model") or MODEL_ID
         n_msgs = len(messages) if isinstance(messages, list) else 1
         n_tools = len(tools) if isinstance(tools, list) else 0
+        # Compat params (PLAN v5 §A): stop / token cap / parallel calls /
+        # response_format / streaming usage flag.
+        stop = body.get("stop")
+        max_tokens = body.get("max_completion_tokens")
+        if max_tokens is None:
+            max_tokens = body.get("max_tokens")
+        parallel_tool_calls = body.get("parallel_tool_calls")
+        response_format = body.get("response_format")
+        # Single kill-switch (currently always None — see function docstring).
+        serve_format = _serve_format_for_response_format(response_format)
+        include_usage = bool((body.get("stream_options") or {}).get("include_usage")) \
+            if isinstance(body.get("stream_options"), dict) else False
+        # Sampling params (§A.5): opencode serve's message body
+        # (additionalProperties:false) exposes no temperature/top_p/penalty
+        # fields, so these cannot be forwarded. Deliberately accepted as a
+        # no-op — rejecting would break every standard OpenAI client (SDKs
+        # send temperature by default) — with a one-line log for visibility.
+        _sampling = {k: body.get(k) for k in
+                     ("temperature", "top_p", "presence_penalty", "frequency_penalty")
+                     if body.get(k) is not None}
+        if _sampling:
+            print(f"[compat] {req_id} sampling params accepted as no-op "
+                  f"(no upstream field): {_sampling}")
         if SHIM_SESSIONS and isinstance(messages, list) and messages:
             try:
                 profile_override = self.headers.get("X-Shim-Profile")
@@ -2330,9 +2658,18 @@ class Handler(BaseHTTPRequestHandler):
                 profile_override = None
             _do_session_turn(self, t0, req_id, messages, tools, tool_choice,
                              stream, req_model, n_msgs, n_tools,
-                             profile_override=profile_override)
+                             profile_override=profile_override,
+                             stop=stop, max_tokens=max_tokens,
+                             parallel_tool_calls=parallel_tool_calls,
+                             response_format=response_format,
+                             include_usage=include_usage,
+                             serve_format=serve_format)
             return
         prompt, atts_raw = messages_to_prompt(messages, tools, tool_choice)
+        # Sole enforcement path (native serve format kill-switched); see note
+        # on the session path above.
+        if response_format:
+            prompt += _response_format_instruction(response_format)
         if tools:
             try:
                 print(f"[tools] n={len(tools)} names={tool_names(tools)[:15]} choice={str(tool_choice)[:120]}")
@@ -2357,7 +2694,8 @@ class Handler(BaseHTTPRequestHandler):
                   f"tools={n_tools} tools_sent={n_tools} sys_drift=0 forked=0 profile=- "
                   f"attach={len(atts_raw)} stream={int(bool(stream))} fence=- tool_calls=0 "
                   f"total_ms={total_ms} finish={finish}")
-            self._json(code, {"error": {"message": str(msg)[:2000], "type": "invalid_request" if code == 400 else "rate_limit"}})
+            _ft = "invalid_request" if code == 400 else ("rate_limit" if code == 429 else "backend_error")
+            self._json(code, _openai_error(msg, _ft))
 
         try:
             normed = normalize_attachments(atts_raw)
@@ -2408,7 +2746,8 @@ class Handler(BaseHTTPRequestHandler):
             _fail(429, "busy: another opencode run in progress, retry shortly", "429")
             return
         try:
-            ok, out, err = run_opencode(prompt, file_parts=file_parts)
+            ok, out, err = run_opencode(prompt, file_parts=file_parts,
+                                        serve_format=serve_format)
         finally:
             _sem.release()
 
@@ -2441,7 +2780,9 @@ class Handler(BaseHTTPRequestHandler):
                   f"tools={n_tools} tools_sent={n_tools} sys_drift=0 forked=0 profile=- "
                   f"attach={len(normed)} stream={int(bool(stream))} fence=- tool_calls=0 "
                   f"total_ms={total_ms} finish={status}")
-            self._json(status, {"error": {"message": msg[:4000], "type": "backend_error", "output": out[:2000]}})
+            _ebody = _openai_error(msg, "rate_limit" if status == 429 else "backend_error")
+            _ebody["error"]["output"] = out[:2000]
+            self._json(status, _ebody)
             return
 
         # Tool-call bridge: if Hermes offered tools, let opencode's output decide.
@@ -2456,9 +2797,16 @@ class Handler(BaseHTTPRequestHandler):
             except Exception as e:
                 print(f"[tools] parse failed: {e}")
                 calls, remaining = [], out
+            if parallel_tool_calls is False and calls and len(calls) > 1:
+                calls = calls[:1]
             if calls:
                 fence = "ok"
                 print(f"[tools] emitting {len(calls)} call(s): {[c['name'] for c in calls]}")
+                _tool_text, _ = _apply_stop(remaining or "", stop)
+                _tool_text, _ = _apply_max_tokens(_tool_text, max_tokens)
+                remaining, out = _tool_text, _tool_text
+                # Never "length" alongside a valid tool call (see session path).
+                _tool_finish = "tool_calls"
                 total_ms = int((time.time() - t0) * 1000)
                 entry = {"id": req_id, "sess": "-", "hit": 0, "depth": n_msgs,
                          "delta_msgs": n_msgs, "delta_bytes": prompt_bytes,
@@ -2467,14 +2815,15 @@ class Handler(BaseHTTPRequestHandler):
                          "sys_drift": 0, "forked": 0, "profile": "-",
                          "attach": len(normed), "stream": int(bool(stream)),
                          "fence": fence, "tool_calls": len(calls),
-                         "total_ms": total_ms, "finish": "tool_calls"}
+                         "total_ms": total_ms, "finish": _tool_finish}
                 _record_request(entry)
                 print(f"[req] id={req_id} sess=- hit=0 depth={n_msgs} "
                       f"delta_msgs={n_msgs} delta_bytes={prompt_bytes} "
                       f"tools={n_tools} tools_sent={n_tools} sys_drift=0 forked=0 profile=- "
                       f"attach={len(normed)} stream={int(bool(stream))} fence={fence} tool_calls={len(calls)} "
-                      f"total_ms={total_ms} finish=tool_calls")
-                resp = chat_completion_tool_response(req_model, remaining or None, calls)
+                      f"total_ms={total_ms} finish={_tool_finish}")
+                resp = chat_completion_tool_response(req_model, remaining or None, calls,
+                                                     finish_reason=_tool_finish)
                 if not stream:
                     self._json(200, resp)
                     return
@@ -2485,11 +2834,24 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_header("Connection", "keep-alive")
                 self._cors()
                 self.end_headers()
-                _sse_send_tool_calls(self, cid, created, req_model, remaining or None, calls)
+                _sse_send_tool_calls(self, cid, created, req_model, remaining or None, calls,
+                                     finish_reason=_tool_finish, usage=resp.get("usage"),
+                                     include_usage=include_usage)
                 return
             out = remaining
             fence = "text"
 
+        # response_format best-effort in flatten mode (no session for a repair
+        # turn): prompt instruction was already injected; validate and log.
+        if response_format and not calls:
+            _rf_ok, _rf_err = _validate_response_format(out, response_format)
+            if not _rf_ok:
+                print(f"[response_format] flatten-mode: output not valid JSON "
+                      f"({_rf_err[:150]}), shipping as-is (no session for repair)")
+        _flat_out, _ = _apply_stop(out or "", stop)
+        _flat_out, _flat_hit_max = _apply_max_tokens(_flat_out, max_tokens)
+        out = _flat_out
+        _flat_finish = "length" if _flat_hit_max else "stop"
         total_ms = int((time.time() - t0) * 1000)
         entry = {"id": req_id, "sess": "-", "hit": 0, "depth": n_msgs,
                  "delta_msgs": n_msgs, "delta_bytes": prompt_bytes,
@@ -2498,14 +2860,14 @@ class Handler(BaseHTTPRequestHandler):
                  "sys_drift": 0, "forked": 0, "profile": "-",
                  "attach": len(normed), "stream": int(bool(stream)),
                  "fence": fence, "tool_calls": 0,
-                 "total_ms": total_ms, "finish": "stop"}
+                 "total_ms": total_ms, "finish": _flat_finish}
         _record_request(entry)
         print(f"[req] id={req_id} sess=- hit=0 depth={n_msgs} "
               f"delta_msgs={n_msgs} delta_bytes={prompt_bytes} "
               f"tools={n_tools} tools_sent={n_tools} sys_drift=0 forked=0 profile=- "
               f"attach={len(normed)} stream={int(bool(stream))} fence={fence} tool_calls=0 "
-              f"total_ms={total_ms} finish=stop")
-        resp = chat_completion_response(req_model, out)
+              f"total_ms={total_ms} finish={_flat_finish}")
+        resp = chat_completion_response(req_model, out, finish_reason=_flat_finish)
         if not stream:
             self._json(200, resp)
             return
@@ -2519,7 +2881,8 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Connection", "keep-alive")
         self._cors()
         self.end_headers()
-        _sse_send_text(self, cid, created, req_model, out)
+        _sse_send_text(self, cid, created, req_model, out, finish_reason=_flat_finish,
+                       usage=resp.get("usage"), include_usage=include_usage)
 
 
 def main():
