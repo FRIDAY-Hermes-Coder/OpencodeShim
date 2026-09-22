@@ -124,6 +124,41 @@ def _openai_error(message, etype="invalid_request", param=None, code=None):
 _UNSUPPORTED_PARAMS = ("logprobs", "top_logprobs", "seed", "logit_bias")
 
 
+def _compat_guard(body):
+    """Phase-1 guards (§A.3/A.7). Returns (code, error_body) or None.
+
+    Runs before any opencode call so silent-wrongness becomes a loud 400.
+    Falsy/disabled values (logprobs:false, top_logprobs:0, logit_bias:{})
+    are harmless and allowed — only values that actually request the
+    unsupported capability are rejected.
+    """
+    _n = body.get("n", 1)
+    if isinstance(_n, (int, float)) and _n > 1:
+        return (400, _openai_error(
+            "n>1 is not supported by this shim (opencode serve produces one "
+            "completion per turn)", "invalid_request",
+            param="n", code="unsupported_parameter"))
+    for _p in _UNSUPPORTED_PARAMS:
+        _v = body.get(_p)
+        if _p == "seed":
+            if _v is None:  # any explicit seed requests determinism
+                continue
+        elif not _v:  # logprobs/top_logprobs/logit_bias: falsy = disabled
+            continue
+        return (400, _openai_error(
+            f"'{_p}' is not supported by this shim (opencode/Zen backend "
+            "does not expose it)", "invalid_request",
+            param=_p, code="unsupported_parameter"))
+    return None
+
+
+def _limit_parallel_calls(calls, parallel_tool_calls):
+    """Honor parallel_tool_calls:false (§A.4) — keep only the first call."""
+    if parallel_tool_calls is False and calls and len(calls) > 1:
+        return calls[:1]
+    return calls
+
+
 def _apply_stop(text, stop):
     """Truncate text at the first occurrence of any stop sequence (§A.1)."""
     if not stop or not text:
@@ -180,6 +215,70 @@ def _response_format_instruction(rf):
     return ""
 
 
+def _validate_json_schema(obj, schema, _path="$"):
+    """Subset JSON Schema validator (§A.6, json_schema mode).
+
+    Supports: type (object/array/string/number/integer/boolean/null),
+    required, properties (recursive), additionalProperties (bool),
+    items (single schema), enum, const. Unknown keywords are ignored.
+    Returns (ok, err).
+    """
+    if not isinstance(schema, dict):
+        return True, None
+    if "const" in schema:
+        if obj != schema["const"]:
+            return False, f"{_path}: value does not match const"
+    if "enum" in schema:
+        try:
+            if obj not in schema["enum"]:
+                return False, f"{_path}: value not in enum"
+        except Exception:
+            return False, f"{_path}: value not in enum"
+    t = schema.get("type")
+    if t is not None:
+        _types = [t] if isinstance(t, str) else (t if isinstance(t, list) else None)
+        if _types is not None:
+            _ok = False
+            for _t in _types:
+                if _t == "object" and isinstance(obj, dict):
+                    _ok = True
+                elif _t == "array" and isinstance(obj, list):
+                    _ok = True
+                elif _t == "string" and isinstance(obj, str):
+                    _ok = True
+                elif _t == "number" and isinstance(obj, (int, float)) and not isinstance(obj, bool):
+                    _ok = True
+                elif _t == "integer" and isinstance(obj, int) and not isinstance(obj, bool):
+                    _ok = True
+                elif _t == "boolean" and isinstance(obj, bool):
+                    _ok = True
+                elif _t == "null" and obj is None:
+                    _ok = True
+            if not _ok:
+                return False, f"{_path}: expected type {_types}, got {type(obj).__name__}"
+    if isinstance(obj, dict):
+        for _k in schema.get("required") or []:
+            if isinstance(_k, str) and _k not in obj:
+                return False, f"{_path}: missing required key '{_k}'"
+        _props = schema.get("properties") or {}
+        if isinstance(_props, dict):
+            for _k, _sub in _props.items():
+                if _k in obj:
+                    _ok, _e = _validate_json_schema(obj[_k], _sub, f"{_path}.{_k}")
+                    if not _ok:
+                        return False, _e
+        if schema.get("additionalProperties") is False and isinstance(_props, dict):
+            _extra = [k for k in obj if k not in _props]
+            if _extra:
+                return False, f"{_path}: additional properties not allowed: {sorted(_extra)[:5]}"
+    if isinstance(obj, list) and isinstance(schema.get("items"), dict):
+        for _i, _item in enumerate(obj):
+            _ok, _e = _validate_json_schema(_item, schema["items"], f"{_path}[{_i}]")
+            if not _ok:
+                return False, _e
+    return True, None
+
+
 def _validate_response_format(text, rf):
     """Check reconciled text against response_format. Returns (ok, err)."""
     if not isinstance(rf, dict):
@@ -195,11 +294,7 @@ def _validate_response_format(text, rf):
         js = rf.get("json_schema") or {}
         schema = (js.get("schema") if isinstance(js, dict) else None) or rf.get("schema")
         if isinstance(schema, dict):
-            req = schema.get("required")
-            if isinstance(req, list) and isinstance(obj, dict):
-                missing = [k for k in req if isinstance(k, str) and k not in obj]
-                if missing:
-                    return False, f"response JSON missing required key(s): {', '.join(missing)}"
+            return _validate_json_schema(obj, schema)
     return True, None
 
 
@@ -812,10 +907,16 @@ def _log_req_line(entry):
           f"finish={entry.get('finish')}" + (f" fork_reason={entry.get('fork_reason')}" if entry.get('fork_reason') else "") + (f" err={entry.get('err')}" if entry.get('err') else ""))
 
 
+def _warnings_header(warnings):
+    """Single Warning header value for sampling no-ops (§A.5)."""
+    return '299 opencode-shim "' + "; ".join(warnings)[:500] + '"'
+
+
 def _do_session_turn(handler, t0, req_id, messages, tools, tool_choice,
                      stream, req_model, n_msgs, n_tools, profile_override=None,
                      stop=None, max_tokens=None, parallel_tool_calls=None,
-                     response_format=None, include_usage=False, serve_format=None):
+                     response_format=None, include_usage=False, serve_format=None,
+                     warnings=None):
     """L1 session path (§2): one Hermes conversation -> one opencode session.
 
     Sends only the delta (new turns). Miss/fork -> create + one full dump.
@@ -882,7 +983,8 @@ def _do_session_turn(handler, t0, req_id, messages, tools, tool_choice,
                  "total_ms": int((time.time() - t0) * 1000), "finish": "cached"}
         _log_req_line(entry)
         print(f"[idempotent] {req_id} served from cache")
-        _serve_cached(handler, cached, stream, req_model, include_usage=include_usage)
+        _serve_cached(handler, cached, stream, req_model, include_usage=include_usage,
+                      warnings=warnings)
         return
 
     # Empty delta on a hit = exact-duplicate of an earlier prefix (e.g. two
@@ -939,18 +1041,18 @@ def _do_session_turn(handler, t0, req_id, messages, tools, tool_choice,
     try:
         normed = normalize_attachments(atts_raw)
     except ValueError as e:
-        fail(400, e, "400")
+        fail(400, e, "400", "invalid_request", param="messages", code_slug="invalid_attachment")
         return
     except Exception as e:
-        fail(400, f"bad attachment: {e}", "400")
+        fail(400, f"bad attachment: {e}", "400", "invalid_request", param="messages", code_slug="invalid_attachment")
         return
     try:
         file_parts, file_notes = prepare_file_inputs(normed)
     except ValueError as e:
-        fail(400, e, "400")
+        fail(400, e, "400", "invalid_request", param="messages", code_slug="unsupported_media")
         return
     except Exception as e:
-        fail(400, f"bad attachment: {e}", "400")
+        fail(400, f"bad attachment: {e}", "400", "invalid_request", param="messages", code_slug="invalid_attachment")
         return
     if file_notes:
         prompt += "\n\n" + "\n".join(file_notes)
@@ -1054,6 +1156,8 @@ def _do_session_turn(handler, t0, req_id, messages, tools, tool_choice,
                 handler.send_header("Content-Type", "text/event-stream")
                 handler.send_header("Cache-Control", "no-cache")
                 handler.send_header("Connection", "keep-alive")
+                if warnings:
+                    handler.send_header("Warning", _warnings_header(warnings))
                 handler._cors()
                 handler.end_headers()
                 stream_live = True
@@ -1260,9 +1364,8 @@ def _do_session_turn(handler, t0, req_id, messages, tools, tool_choice,
             else:
                 fence = "failed"
                 print(f"[tools] repair turn failed: {err_r[:200]}")
-        if parallel_tool_calls is False and calls and len(calls) > 1:
-            # §A.4: client opted out of parallel calls — keep only the first.
-            calls = calls[:1]
+        # §A.4: client opted out of parallel calls — keep only the first.
+        calls = _limit_parallel_calls(calls, parallel_tool_calls)
         if calls:
             if fence == "text":
                 fence = "ok"
@@ -1299,8 +1402,7 @@ def _do_session_turn(handler, t0, req_id, messages, tools, tool_choice,
                 try:
                     calls2, remaining2, _ = parse_fence(out, tools, forced_name)
                     if calls2:
-                        if parallel_tool_calls is False and len(calls2) > 1:
-                            calls2 = calls2[:1]
+                        calls2 = _limit_parallel_calls(calls2, parallel_tool_calls)
                         calls, out = calls2, remaining2
                         tcs = _openai_tool_calls(calls)
                         store.note_tool_calls(sid, {tc["id"]: tc["function"]["name"] for tc in tcs})
@@ -1473,6 +1575,8 @@ def _do_session_turn(handler, t0, req_id, messages, tools, tool_choice,
         handler.send_header("Content-Type", "text/event-stream")
         handler.send_header("Cache-Control", "no-cache")
         handler.send_header("Connection", "keep-alive")
+        if warnings:
+            handler.send_header("Warning", _warnings_header(warnings))
         handler._cors()
         handler.end_headers()
         _sse_send_tool_calls(handler, cid, created, req_model, remaining or None, calls, tcs=tcs,
@@ -1485,18 +1589,25 @@ def _do_session_turn(handler, t0, req_id, messages, tools, tool_choice,
         handler.send_header("Content-Type", "text/event-stream")
         handler.send_header("Cache-Control", "no-cache")
         handler.send_header("Connection", "keep-alive")
+        if warnings:
+            handler.send_header("Warning", _warnings_header(warnings))
         handler._cors()
         handler.end_headers()
         _sse_send_text(handler, cid, created, req_model, out, finish_reason=_finish,
                        usage=usage, include_usage=include_usage)
         return
+    if warnings:
+        resp["x_shim_warnings"] = list(warnings)
     handler._json(200, resp)
 
 
-def _serve_cached(self, cached, stream, req_model, include_usage=False):
+def _serve_cached(self, cached, stream, req_model, include_usage=False, warnings=None):
     """Re-emit an idempotent-cached response in the requested format."""
     resp = cached["resp"]
     if not stream:
+        if warnings:
+            resp = dict(resp)
+            resp["x_shim_warnings"] = list(warnings)
         self._json(200, resp)
         return
     cid, created = resp["id"], resp["created"]
@@ -1504,6 +1615,8 @@ def _serve_cached(self, cached, stream, req_model, include_usage=False):
     self.send_header("Content-Type", "text/event-stream")
     self.send_header("Cache-Control", "no-cache")
     self.send_header("Connection", "keep-alive")
+    if warnings:
+        self.send_header("Warning", _warnings_header(warnings))
     self._cors()
     self.end_headers()
     _finish = ((resp.get("choices") or [{}])[0] or {}).get("finish_reason") or "stop"
@@ -2589,25 +2702,17 @@ class Handler(BaseHTTPRequestHandler):
         try:
             body = json.loads(raw.decode() or "{}")
         except Exception:
-            self._json(400, _openai_error("invalid JSON body", "invalid_request"))
+            self._json(400, _openai_error("invalid JSON body", "invalid_request",
+                                               code="invalid_json"))
             return
 
         # --- OpenAI compat guards (PLAN v5 Phase 1): fail fast, before any
         # opencode call, so silent-wrongness becomes a loud 400. ---
-        _n = body.get("n", 1)
-        if isinstance(_n, int) and _n > 1:
-            self._json(400, _openai_error(
-                "n>1 is not supported by this shim (opencode serve produces one "
-                "completion per turn)", "invalid_request",
-                param="n", code="unsupported_parameter"))
+        _guard = _compat_guard(body)
+        if _guard is not None:
+            _gcode, _gebody = _guard
+            self._json(_gcode, _gebody)
             return
-        for _p in _UNSUPPORTED_PARAMS:
-            if body.get(_p) is not None:
-                self._json(400, _openai_error(
-                    f"'{_p}' is not supported by this shim (opencode/Zen backend "
-                    "does not expose it)", "invalid_request",
-                    param=_p, code="unsupported_parameter"))
-                return
 
         messages = body.get("messages", [])
         if not isinstance(messages, list) or len(messages) == 0:
@@ -2648,6 +2753,10 @@ class Handler(BaseHTTPRequestHandler):
         _sampling = {k: body.get(k) for k in
                      ("temperature", "top_p", "presence_penalty", "frequency_penalty")
                      if body.get(k) is not None}
+        # Surfaced to the client (body field on JSON responses, Warning
+        # header on SSE) so the no-op is visible, not silent (§A.5).
+        _warnings = [f"{k} ignored: no upstream field in opencode serve message body"
+                     for k in sorted(_sampling)] if _sampling else []
         if _sampling:
             print(f"[compat] {req_id} sampling params accepted as no-op "
                   f"(no upstream field): {_sampling}")
@@ -2663,7 +2772,8 @@ class Handler(BaseHTTPRequestHandler):
                              parallel_tool_calls=parallel_tool_calls,
                              response_format=response_format,
                              include_usage=include_usage,
-                             serve_format=serve_format)
+                             serve_format=serve_format,
+                             warnings=_warnings)
             return
         prompt, atts_raw = messages_to_prompt(messages, tools, tool_choice)
         # Sole enforcement path (native serve format kill-switched); see note
@@ -2678,7 +2788,7 @@ class Handler(BaseHTTPRequestHandler):
 
         # Normalize attachments BEFORE acquiring the LLM slot: downloads/reads
         # must not hold semaphore. Bad files -> fast 400, no retry burn.
-        def _fail(code, msg, finish):
+        def _fail(code, msg, finish, param=None, code_slug=None):
             total_ms = int((time.time() - t0) * 1000)
             entry = {"id": req_id, "sess": "-", "hit": 0, "depth": n_msgs,
                      "delta_msgs": n_msgs, "delta_bytes": len(prompt.encode()),
@@ -2695,15 +2805,15 @@ class Handler(BaseHTTPRequestHandler):
                   f"attach={len(atts_raw)} stream={int(bool(stream))} fence=- tool_calls=0 "
                   f"total_ms={total_ms} finish={finish}")
             _ft = "invalid_request" if code == 400 else ("rate_limit" if code == 429 else "backend_error")
-            self._json(code, _openai_error(msg, _ft))
+            self._json(code, _openai_error(msg, _ft, param=param, code=code_slug))
 
         try:
             normed = normalize_attachments(atts_raw)
         except ValueError as e:
-            _fail(400, e, "400")
+            _fail(400, e, "400", param="messages", code_slug="invalid_attachment")
             return
         except Exception as e:
-            _fail(400, f"bad attachment: {e}", "400")
+            _fail(400, f"bad attachment: {e}", "400", param="messages", code_slug="invalid_attachment")
             return
 
         # Split into serve file-parts vs tool-readable inbox notes. Gated
@@ -2711,10 +2821,10 @@ class Handler(BaseHTTPRequestHandler):
         try:
             file_parts, file_notes = prepare_file_inputs(normed)
         except ValueError as e:
-            _fail(400, e, "400")
+            _fail(400, e, "400", param="messages", code_slug="unsupported_media")
             return
         except Exception as e:
-            _fail(400, f"bad attachment: {e}", "400")
+            _fail(400, f"bad attachment: {e}", "400", param="messages", code_slug="invalid_attachment")
             return
         if file_notes:
             prompt += "\n\n" + "\n".join(file_notes)
@@ -2797,8 +2907,7 @@ class Handler(BaseHTTPRequestHandler):
             except Exception as e:
                 print(f"[tools] parse failed: {e}")
                 calls, remaining = [], out
-            if parallel_tool_calls is False and calls and len(calls) > 1:
-                calls = calls[:1]
+            calls = _limit_parallel_calls(calls, parallel_tool_calls)
             if calls:
                 fence = "ok"
                 print(f"[tools] emitting {len(calls)} call(s): {[c['name'] for c in calls]}")
@@ -2824,6 +2933,8 @@ class Handler(BaseHTTPRequestHandler):
                       f"total_ms={total_ms} finish={_tool_finish}")
                 resp = chat_completion_tool_response(req_model, remaining or None, calls,
                                                      finish_reason=_tool_finish)
+                if _warnings:
+                    resp["x_shim_warnings"] = list(_warnings)
                 if not stream:
                     self._json(200, resp)
                     return
@@ -2832,6 +2943,8 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_header("Content-Type", "text/event-stream")
                 self.send_header("Cache-Control", "no-cache")
                 self.send_header("Connection", "keep-alive")
+                if _warnings:
+                    self.send_header("Warning", _warnings_header(_warnings))
                 self._cors()
                 self.end_headers()
                 _sse_send_tool_calls(self, cid, created, req_model, remaining or None, calls,
@@ -2841,13 +2954,16 @@ class Handler(BaseHTTPRequestHandler):
             out = remaining
             fence = "text"
 
-        # response_format best-effort in flatten mode (no session for a repair
-        # turn): prompt instruction was already injected; validate and log.
+        # response_format in flatten mode (no session for a repair turn):
+        # prompt instruction was already injected. If the output still does
+        # not validate, fail loudly (502) rather than shipping malformed
+        # JSON as a "successful" 200 (§A.6).
         if response_format and not calls:
             _rf_ok, _rf_err = _validate_response_format(out, response_format)
             if not _rf_ok:
-                print(f"[response_format] flatten-mode: output not valid JSON "
-                      f"({_rf_err[:150]}), shipping as-is (no session for repair)")
+                _fail(502, ("response_format could not be satisfied: model did not "
+                            f"produce valid JSON ({(_rf_err or 'unknown')[:300]})"),
+                      "502")
         _flat_out, _ = _apply_stop(out or "", stop)
         _flat_out, _flat_hit_max = _apply_max_tokens(_flat_out, max_tokens)
         out = _flat_out
@@ -2868,6 +2984,8 @@ class Handler(BaseHTTPRequestHandler):
               f"attach={len(normed)} stream={int(bool(stream))} fence={fence} tool_calls=0 "
               f"total_ms={total_ms} finish={_flat_finish}")
         resp = chat_completion_response(req_model, out, finish_reason=_flat_finish)
+        if _warnings:
+            resp["x_shim_warnings"] = list(_warnings)
         if not stream:
             self._json(200, resp)
             return
@@ -2879,6 +2997,8 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", "text/event-stream")
         self.send_header("Cache-Control", "no-cache")
         self.send_header("Connection", "keep-alive")
+        if _warnings:
+            self.send_header("Warning", _warnings_header(_warnings))
         self._cors()
         self.end_headers()
         _sse_send_text(self, cid, created, req_model, out, finish_reason=_flat_finish,

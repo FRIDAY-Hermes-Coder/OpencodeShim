@@ -122,7 +122,9 @@ def canon(m):
         m = {"role": "user", "content": str(m)}
     role = m.get("role") or "user"
     content = m.get("content")
-    if role == "system" and isinstance(content, str):
+    # o1-and-newer clients may send role "developer" instead of "system"
+    # (§B.2) — normalize it the same way so volatile content hashes stable.
+    if role in ("system", "developer") and isinstance(content, str):
         content = norm_system(content)
     else:
         content = norm_content(content)
