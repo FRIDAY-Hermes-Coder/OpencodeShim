@@ -235,6 +235,46 @@ def _make_gated_delta(inner_emit, stop, max_tokens):
     return gated
 
 
+def _tool_input_preview(inp, limit=120):
+    """One-line preview of an opencode tool input for TUI narration."""
+    try:
+        if isinstance(inp, dict):
+            for k in ("command", "cmd", "filePath", "path", "file", "query",
+                      "pattern", "url", "prompt", "description", "title", "text"):
+                v = inp.get(k)
+                if isinstance(v, str) and v.strip():
+                    s = " ".join(v.split())
+                    return s[:limit] + ("…" if len(s) > limit else "")
+            s = " ".join(json.dumps(inp, separators=(",", ":"))[:limit * 2].split())
+            return s[:limit]
+        s = " ".join(str(inp).split())
+        return s[:limit]
+    except Exception:
+        return ""
+
+
+def _fence_holdback(chunk, marker):
+    """Split chunk into (visible, held) at the fence marker.
+
+    Returns (visible, held): everything from the first marker occurrence
+    onward is held (fence protocol, never streamed); if no marker, holds
+    only a trailing overlap that could become the marker split across
+    SSE chunks (e.g. "```hermes-" | "toolcalls").
+    """
+    idx = chunk.find(marker)
+    if idx != -1:
+        return chunk[:idx], chunk[idx:]
+    hold = 0
+    max_hold = min(len(chunk), len(marker))
+    for n in range(max_hold, 0, -1):
+        if marker.startswith(chunk[-n:]):
+            hold = n
+            break
+    if hold:
+        return chunk[:-hold], chunk[-hold:]
+    return chunk, ""
+
+
 def _response_format_instruction(rf):
     """Prompt instruction enforcing response_format (§A.6). Returns "" if none."""
     if not isinstance(rf, dict):
@@ -763,7 +803,7 @@ def _run_session_turn(sid, prompt, file_parts, agent=None, model_override=None,
 # --- Phase 3 streaming relay (§4 plan_enhanced.md) ---
 SHIM_IDLE_TIMEOUT = int(os.environ.get("SHIM_IDLE_TIMEOUT", "120"))  # s since last event
 SHIM_HEARTBEAT = int(os.environ.get("SHIM_HEARTBEAT", "10"))  # SSE ping interval (stream path)
-SHIM_NARRATE_TOOLS = os.environ.get("SHIM_NARRATE_TOOLS", "0") == "1"
+SHIM_NARRATE_TOOLS = os.environ.get("SHIM_NARRATE_TOOLS", "1") == "1"
 
 
 def _prompt_async(sid, body):
@@ -834,11 +874,15 @@ def _event_subscriber(stop_flag, q):
         q.put(("eof", str(e)[:200]))
 
 
-def _relay_turn(sid, msg_body, wall_timeout, on_delta=None, should_stop=None):
+def _relay_turn(sid, msg_body, wall_timeout, on_delta=None, should_stop=None,
+                fence_safe=False):
     """Run one turn via prompt_async + /event relay.
 
     on_delta(text) forwards live text (stream path) else buffered only.
     on_delta(None) means heartbeat ping requested.
+    fence_safe suppresses the ```hermes-toolcalls block from the live
+    stream (shim-internal protocol; Hermes only ever sees parsed
+    tool_calls + stripped content). Ordinary code fences stream untouched.
     Returns (ok, full_text, err, meta{ttfb_ms, usage, events, streamed_chunks}).
     Full text is reconciled from GET message (never assembled from deltas).
     """
@@ -852,6 +896,9 @@ def _relay_turn(sid, msg_body, wall_timeout, on_delta=None, should_stop=None):
     # Connect the subscriber before prompt_async so early events aren't missed.
     time.sleep(0.5)
     last_part_id = None
+    fence_marker = "```" + TOOLCALL_FENCE
+    fence_state = {"buf": "", "fenced": False}
+    seen_reasoning_parts = set()
     ok, err = _prompt_async(sid, msg_body)
     if not ok:
         stop_flag.set()
@@ -882,10 +929,48 @@ def _relay_turn(sid, msg_body, wall_timeout, on_delta=None, should_stop=None):
             etype = payload.get("type", "")
             if etype == "message.part.delta":
                 d = props.get("delta", "")
-                if props.get("field") == "text" and d:
+                field = props.get("field", "")
+                if field == "reasoning" and d and SHIM_NARRATE_TOOLS:
+                    # Opencode thinking: show it live (TUI keeps a thinking
+                    # section expanded by default). Tracked in displayed_text
+                    # only — reconciled full text holds answer parts, so this
+                    # must not count toward streamed_text / catch-up diffing.
                     if ttfb is None:
                         ttfb = now
                         meta["ttfb_ms"] = int((ttfb - t_start) * 1000)
+                    _pid = props.get("partID") or (props.get("part") or {}).get("id")
+                    if _pid:
+                        seen_reasoning_parts.add(_pid)
+                    if on_delta:
+                        try:
+                            on_delta(d)
+                            meta["streamed_chunks"] += 1
+                            meta["displayed_text"] += d
+                        except Exception:
+                            fatal = "client disconnected"
+                            break
+                    last_forward = now
+                elif field == "text" and d:
+                    if ttfb is None:
+                        ttfb = now
+                        meta["ttfb_ms"] = int((ttfb - t_start) * 1000)
+                    if fence_safe:
+                        if fence_state["fenced"]:
+                            last_forward = now
+                            continue  # fence tail: protocol, never streamed
+                        chunk = fence_state["buf"] + d
+                        fence_state["buf"] = ""
+                        vis, held = _fence_holdback(chunk, fence_marker)
+                        if held.startswith(fence_marker):
+                            fence_state["fenced"] = True
+                        if not vis:
+                            # Wholly fence (or a fence-head overlap split
+                            # across chunks): hold it, forward nothing.
+                            fence_state["buf"] = held
+                            last_forward = now
+                            continue
+                        fence_state["buf"] = held
+                        d = vis
                     part_id = props.get("partID") or (props.get("part") or {}).get("id")
                     if part_id and part_id != last_part_id and meta["streamed_text"] and not meta["streamed_text"].endswith("\n"):
                         sep = "\n\n"
@@ -906,12 +991,61 @@ def _relay_turn(sid, msg_body, wall_timeout, on_delta=None, should_stop=None):
                     last_forward = now
             elif etype == "message.part.updated":
                 part = props.get("part") or {}
-                if SHIM_NARRATE_TOOLS and part.get("type") == "tool" and part.get("state", {}).get("status") == "completed":
+                ptype = part.get("type")
+                if ptype == "tool" and SHIM_NARRATE_TOOLS:
+                    st = part.get("state") if isinstance(part.get("state"), dict) else {}
+                    status = (st or {}).get("status")
                     tool_name = part.get("tool") or "tool"
-                    summary = f"\n\u2699 {tool_name}\n"
-                    if on_delta:
-                        on_delta(summary)
-                    meta["displayed_text"] += summary
+                    line = None
+                    if status == "running":
+                        preview = _tool_input_preview((st or {}).get("input"))
+                        title = (st or {}).get("title") or preview
+                        line = f"\n⚙ {tool_name}… {title}\n" if title else f"\n⚙ {tool_name}…\n"
+                    elif status == "completed":
+                        title = (st or {}).get("title") or _tool_input_preview((st or {}).get("input"))
+                        dur = ""
+                        try:
+                            _t = (st or {}).get("time") or {}
+                            if _t.get("start") and _t.get("end"):
+                                dur = f" ({float(_t['end'] - _t['start']) / 1000:.1f}s)"
+                        except Exception:
+                            dur = ""
+                        tail = f" — {title}" if title else ""
+                        line = f"\n⚙ {tool_name}{tail}{dur}\n"
+                    elif status == "error":
+                        err_s = str((st or {}).get("error") or "")[:200].replace("\n", " ")
+                        line = f"\n⚙ {tool_name} failed: {err_s}\n" if err_s else f"\n⚙ {tool_name} failed\n"
+                    if line:
+                        if ttfb is None:
+                            ttfb = now
+                            meta["ttfb_ms"] = int((ttfb - t_start) * 1000)
+                        if on_delta:
+                            try:
+                                on_delta(line)
+                            except Exception:
+                                fatal = "client disconnected"
+                                break
+                        meta["displayed_text"] += line
+                        last_forward = now
+                elif ptype == "reasoning" and SHIM_NARRATE_TOOLS:
+                    # Fallback for builds that never emit reasoning deltas:
+                    # forward the part text once.
+                    _pid = part.get("id")
+                    _txt = part.get("text") if isinstance(part.get("text"), str) else ""
+                    if _txt and _pid not in seen_reasoning_parts:
+                        seen_reasoning_parts.add(_pid)
+                        if ttfb is None:
+                            ttfb = now
+                            meta["ttfb_ms"] = int((ttfb - t_start) * 1000)
+                        if on_delta:
+                            try:
+                                on_delta(_txt)
+                                meta["streamed_chunks"] += 1
+                                meta["displayed_text"] += _txt
+                            except Exception:
+                                fatal = "client disconnected"
+                                break
+                        last_forward = now
             elif etype == "session.idle":
                 break  # success; reconcile below
             elif etype == "session.error":
@@ -935,6 +1069,18 @@ def _relay_turn(sid, msg_body, wall_timeout, on_delta=None, should_stop=None):
     if fatal:
         _abort_turn(sid)
         return False, "", fatal, meta
+    # Flush a held trailing overlap that never completed into the fence
+    # marker: it is real prose, not protocol — forward it now so no text
+    # is silently dropped at the turn boundary.
+    if fence_state.get("buf") and not fence_state.get("fenced") and on_delta:
+        try:
+            on_delta(fence_state["buf"])
+            meta["streamed_chunks"] += 1
+            meta["streamed_text"] += fence_state["buf"]
+            meta["displayed_text"] += fence_state["buf"]
+        except Exception:
+            pass
+        fence_state["buf"] = ""
     try:
         ok2, msgs = _serve_call("GET", f"/session/{sid}/message", timeout=30)
         if not ok2 or not isinstance(msgs, list):
@@ -948,10 +1094,28 @@ def _relay_turn(sid, msg_body, wall_timeout, on_delta=None, should_stop=None):
                  if p.get("type") == "text" and p.get("text")]
         full = "\n".join(texts).strip()
         toks = last_m.get("info", {}).get("tokens", {}) or {}
-        if isinstance(toks, dict) and (toks.get("input") or toks.get("output")):
-            meta["usage"] = {"prompt_tokens": int(toks.get("input") or 0),
-                             "completion_tokens": int(toks.get("output") or 0),
-                             "total_tokens": int(toks.get("input") or 0) + int(toks.get("output") or 0)}
+        cache = toks.get("cache") if isinstance(toks, dict) else None
+        cache = cache if isinstance(cache, dict) else {}
+        if isinstance(toks, dict) and (toks.get("input") or toks.get("output")
+                                       or cache.get("read") or cache.get("write")
+                                       or toks.get("reasoning")):
+            _inp = int(toks.get("input") or 0)
+            _out = int(toks.get("output") or 0)
+            _reas = int(toks.get("reasoning") or 0)
+            _cread = int(cache.get("read") or 0)
+            _cwrite = int(cache.get("write") or 0)
+            # Hermes CanonicalUsage.prompt_tokens = input + cache_read +
+            # cache_write (agent/usage_pricing.py). Reporting input alone
+            # under-reports the context bar ~150x on cached turns
+            # (e.g. 293 shown vs 293+49905 real). Reasoning travels in
+            # completion_tokens_details so session_reasoning_tokens accrues.
+            _prompt = _inp + _cread + _cwrite
+            meta["usage"] = {"prompt_tokens": _prompt,
+                             "completion_tokens": _out,
+                             "total_tokens": _prompt + _out,
+                             "prompt_tokens_details": {"cached_tokens": _cread,
+                                                       "cache_write_tokens": _cwrite},
+                             "completion_tokens_details": {"reasoning_tokens": _reas}}
         if not meta["usage"]:
             with _stats_lock:
                 _stats["usage_estimated"] += 1
@@ -1269,12 +1433,22 @@ def _do_session_turn(handler, t0, req_id, messages, tools, tool_choice,
         # repair-turn design can't un-send bytes).
         _needs_full_buffer = bool(response_format)   # only json-mode still buffers whole-turn
         on_delta = None
-        if stream and not tools and not _needs_full_buffer:
-            on_delta = (_make_gated_delta(_emit_live, stop, max_tokens)
-                        if (stop or max_tokens) else _emit_live)
+        if stream and not _needs_full_buffer:
+            # Stream even on tool turns: opencode's own tool/reasoning steps
+            # are the only liveness signal during long delegated turns
+            # (previously `and not tools` left Hermes silent for 60-300s).
+            # Fence suppression keeps the ```hermes-toolcalls protocol block
+            # out of the live stream when a fence is possible.
+            _fence_possible = bool(tools) and tool_choice != "none"
+            _live = (_make_gated_delta(_emit_live, stop, max_tokens)
+                     if (stop or max_tokens) else _emit_live)
+            on_delta = _live
+            print(f"[stream] tools={bool(tools)} choice={str(tool_choice)[:20]} "
+                  f"fence_safe={bool(_fence_possible and stream and not _needs_full_buffer)}")
         ok_r, text_r, err_r, meta_r = _relay_turn(
             exec_sid, body, _wt,
-            on_delta=on_delta)
+            on_delta=on_delta,
+            fence_safe=_fence_possible if stream and not _needs_full_buffer else False)
         if ok_r:
             return True, text_r, "", meta_r, True
         # Fallback: blocking call only when prompt_async never started the turn
@@ -1725,7 +1899,15 @@ def _do_session_turn(handler, t0, req_id, messages, tools, tool_choice,
         cid, created = resp["id"], resp["created"]
         try:
             if calls:
-                _sse_send_tool_calls(handler, cid, created, req_model, None, calls, tcs=tcs,
+                # Prefix prose already streamed live stays unsent (content
+                # None avoids duplication); anything never streamed (zero
+                # deltas, or held back) is sent here so it isn't lost.
+                _flat_rem = re.sub(r"\s+", "", remaining or "")
+                _flat_stm = re.sub(r"\s+", "", relay_meta.get("streamed_text", ""))
+                _tool_content = (None if not (remaining or "").strip()
+                                 or (_flat_rem and _flat_rem == _flat_stm)
+                                 else remaining)
+                _sse_send_tool_calls(handler, cid, created, req_model, _tool_content, calls, tcs=tcs,
                                      finish_reason=_finish, usage=usage,
                                      include_usage=include_usage)
             else:
@@ -2734,7 +2916,7 @@ def chat_completion_response(model, content, cid=None, created=None, usage=None,
 
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = "OpencodeShim/2.6-phase4"
+    server_version = "OpencodeShim/2.7-tui-fix"
 
     def log_message(self, fmt, *args):
         print(f"[{time.strftime('%H:%M:%S')}] {self.address_string()} {fmt % args}")
