@@ -804,6 +804,7 @@ def _run_session_turn(sid, prompt, file_parts, agent=None, model_override=None,
 SHIM_IDLE_TIMEOUT = int(os.environ.get("SHIM_IDLE_TIMEOUT", "120"))  # s since last event
 SHIM_HEARTBEAT = int(os.environ.get("SHIM_HEARTBEAT", "10"))  # SSE ping interval (stream path)
 SHIM_NARRATE_TOOLS = os.environ.get("SHIM_NARRATE_TOOLS", "1") == "1"
+SHIM_SUPPRESS_FENCE = os.environ.get("SHIM_SUPPRESS_FENCE", "0") == "1"  # 1=hold back ```hermes-toolcalls from live stream
 
 
 def _prompt_async(sid, body):
@@ -899,6 +900,7 @@ def _relay_turn(sid, msg_body, wall_timeout, on_delta=None, should_stop=None,
     fence_marker = "```" + TOOLCALL_FENCE
     fence_state = {"buf": "", "fenced": False}
     seen_reasoning_parts = set()
+    seen_tool_parts = {}   # part_id -> set of lifecycle statuses already narrated (v8)
     ok, err = _prompt_async(sid, msg_body)
     if not ok:
         stop_flag.set()
@@ -993,15 +995,31 @@ def _relay_turn(sid, msg_body, wall_timeout, on_delta=None, should_stop=None,
                 part = props.get("part") or {}
                 ptype = part.get("type")
                 if ptype == "tool" and SHIM_NARRATE_TOOLS:
+                    _tpid = part.get("id")
                     st = part.get("state") if isinstance(part.get("state"), dict) else {}
                     status = (st or {}).get("status")
                     tool_name = part.get("tool") or "tool"
+                    _seen = seen_tool_parts.setdefault(_tpid, set()) if _tpid else None
                     line = None
-                    if status == "running":
+
+                    def _once(tag):
+                        # No part id (shouldn't happen, but don't silently
+                        # drop the narration if it does) -> always allow;
+                        # otherwise narrate a given lifecycle stage for this
+                        # part exactly once (v8: incremental running updates
+                        # as input streams in must not re-narrate).
+                        if _seen is None:
+                            return True
+                        if tag in _seen:
+                            return False
+                        _seen.add(tag)
+                        return True
+
+                    if status == "running" and _once("running"):
                         preview = _tool_input_preview((st or {}).get("input"))
                         title = (st or {}).get("title") or preview
                         line = f"\n⚙ {tool_name}… {title}\n" if title else f"\n⚙ {tool_name}…\n"
-                    elif status == "completed":
+                    elif status == "completed" and _once("completed"):
                         title = (st or {}).get("title") or _tool_input_preview((st or {}).get("input"))
                         dur = ""
                         try:
@@ -1012,7 +1030,7 @@ def _relay_turn(sid, msg_body, wall_timeout, on_delta=None, should_stop=None,
                             dur = ""
                         tail = f" — {title}" if title else ""
                         line = f"\n⚙ {tool_name}{tail}{dur}\n"
-                    elif status == "error":
+                    elif status == "error" and _once("error"):
                         err_s = str((st or {}).get("error") or "")[:200].replace("\n", " ")
                         line = f"\n⚙ {tool_name} failed: {err_s}\n" if err_s else f"\n⚙ {tool_name} failed\n"
                     if line:
@@ -1479,12 +1497,12 @@ def _do_session_turn(handler, t0, req_id, messages, tools, tool_choice,
             # (previously `and not tools` left Hermes silent for 60-300s).
             # Fence suppression keeps the ```hermes-toolcalls protocol block
             # out of the live stream when a fence is possible.
-            _fence_possible = bool(tools) and tool_choice != "none"
+            _fence_possible = bool(tools) and tool_choice != "none" and SHIM_SUPPRESS_FENCE
             _live = (_make_gated_delta(_emit_live, stop, max_tokens)
                      if (stop or max_tokens) else _emit_live)
             on_delta = _live
             print(f"[stream] tools={bool(tools)} choice={str(tool_choice)[:20]} "
-                  f"fence_safe={bool(_fence_possible and stream and not _needs_full_buffer)}")
+                  f"fence_safe={bool(_fence_possible and stream and not _needs_full_buffer)} suppress={SHIM_SUPPRESS_FENCE}")
         ok_r, text_r, err_r, meta_r = _relay_turn(
             exec_sid, body, _wt,
             on_delta=on_delta,
