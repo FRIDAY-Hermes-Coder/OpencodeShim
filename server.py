@@ -1145,40 +1145,80 @@ def _openai_tool_calls(calls):
 
 
 def _fetch_models():
-    """Discover available models from opencode serve. Returns list of model dicts."""
+    """Discover available models from opencode serve. Returns list of model dicts.
+
+    serve 1.18.x has no GET /global/models (unknown paths fall back to the
+    SPA HTML shell, which fails JSON parsing and collapsed the list to the
+    single MODEL_ID fallback). Discover via GET /config/providers (opencode
+    provider's model map) + `opencode models opencode` CLI fallback, merged
+    and de-duplicated. SHIM_EXTRA_MODELS="a,b" appends manual ids.
+    """
     global _models_cache
     now = time.time()
     with _models_cache_lock:
         if _models_cache["models"] and (now - _models_cache["updated"] < SHIM_MODELS_CACHE_TTL):
             return _models_cache["models"]
-    ok, resp = _serve_call("GET", "/global/models", timeout=10)
-    if not ok:
-        # Fallback: try /global/health to check serve is up, then return default
-        return [{"id": MODEL_ID, "object": "model",
-                 "created": int(time.time()), "owned_by": "opencode-shim"}]
-    if isinstance(resp, dict):
-        models = resp.get("models") or resp.get("data") or resp.get("models")
-        if isinstance(models, list) and models:
-            normalized = []
-            for m in models:
-                if isinstance(m, dict):
-                    mid = m.get("id") or m.get("modelID") or m.get("name")
-                    if mid:
-                        normalized.append({
-                            "id": str(mid),
-                            "object": "model",
-                            "created": m.get("created", int(time.time())),
-                            "owned_by": m.get("owned_by", "opencode"),
-                        })
-            if normalized:
-                # Rank most powerful first (stable sort)
-                normalized.sort(key=lambda m: (_model_power_score(m["id"]), m["id"]))
-                with _models_cache_lock:
-                    _models_cache["models"] = normalized
-                    _models_cache["updated"] = now
-                print(f"[models] discovered {len(normalized)} ranked: { [m['id'] for m in normalized[:8]] }")
-                return normalized
-    # Serve returned something unexpected; use the configured model as fallback
+    ids = collections.OrderedDict()
+    # 1. HTTP discovery: /config/providers -> providers[].models keys
+    try:
+        ok, resp = _serve_call("GET", "/config/providers", timeout=10)
+        if ok and isinstance(resp, dict):
+            for p in resp.get("providers") or []:
+                if not isinstance(p, dict):
+                    continue
+                if p.get("id") != "opencode":
+                    continue
+                models_map = p.get("models") or {}
+                if isinstance(models_map, dict):
+                    for key in models_map.keys():
+                        short = str(key).split("/")[-1] if key else ""
+                        if short:
+                            ids[short] = True
+    except Exception as e:
+        print(f"[models] /config/providers discovery failed: {e}")
+    # 2. CLI fallback: `opencode models opencode` (authoritative Zen list,
+    # includes cache-refreshed entries serve may not report yet).
+    try:
+        p = subprocess.run([OPENCODE_BIN, "models", "opencode"],
+                           capture_output=True, text=True, timeout=15)
+        if p.returncode == 0:
+            for line in (p.stdout or "").splitlines():
+                line = line.strip()
+                if not line or line.startswith((" ", "#", "-", "Usage", "Options", "Positionals", "Commands")):
+                    continue
+                if "/" in line:
+                    short = line.split("/")[-1].strip()
+                else:
+                    short = line.split()[0].strip()
+                if short and re.match(r"^[A-Za-z0-9._:-]+$", short):
+                    ids[short] = True
+        else:
+            print(f"[models] CLI fallback failed: {(p.stderr or '')[:200]}")
+    except Exception as e:
+        print(f"[models] CLI discovery failed: {e}")
+    # 3. Manual extras + configured defaults always present.
+    try:
+        for extra in os.environ.get("SHIM_EXTRA_MODELS", "").split(","):
+            extra = extra.strip().split("/")[-1] if extra.strip() else ""
+            if extra:
+                ids[extra] = True
+    except Exception:
+        pass
+    for d in (MODEL_ID, SHIM_OPENCODE_MODEL.split("/")[-1] if "/" in SHIM_OPENCODE_MODEL else SHIM_OPENCODE_MODEL):
+        if d:
+            ids[d] = True
+    if ids:
+        normalized = [{"id": mid, "object": "model",
+                       "created": int(time.time()), "owned_by": "opencode"}
+                      for mid in ids.keys()]
+        # Rank most powerful first (stable sort)
+        normalized.sort(key=lambda m: (_model_power_score(m["id"]), m["id"]))
+        with _models_cache_lock:
+            _models_cache["models"] = normalized
+            _models_cache["updated"] = now
+        print(f"[models] discovered {len(normalized)} ranked: {[m['id'] for m in normalized[:12]]}")
+        return normalized
+    # Serve down and CLI failed: single-model fallback so chat still works.
     return [{"id": MODEL_ID, "object": "model",
              "created": int(time.time()), "owned_by": "opencode-shim"}]
 # --- Phase 0 observability (§7 plan_enhanced.md): structured req log + debug ---
@@ -2916,7 +2956,7 @@ def chat_completion_response(model, content, cid=None, created=None, usage=None,
 
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = "OpencodeShim/2.7-tui-fix"
+    server_version = "OpencodeShim/2.8-models-fix"
 
     def log_message(self, fmt, *args):
         print(f"[{time.strftime('%H:%M:%S')}] {self.address_string()} {fmt % args}")
