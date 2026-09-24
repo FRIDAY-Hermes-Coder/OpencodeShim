@@ -803,8 +803,15 @@ def _run_session_turn(sid, prompt, file_parts, agent=None, model_override=None,
 # --- Phase 3 streaming relay (§4 plan_enhanced.md) ---
 SHIM_IDLE_TIMEOUT = int(os.environ.get("SHIM_IDLE_TIMEOUT", "120"))  # s since last event
 SHIM_HEARTBEAT = int(os.environ.get("SHIM_HEARTBEAT", "10"))  # SSE ping interval (stream path)
-SHIM_NARRATE_TOOLS = os.environ.get("SHIM_NARRATE_TOOLS", "1") == "1"
-SHIM_SUPPRESS_FENCE = os.environ.get("SHIM_SUPPRESS_FENCE", "0") == "1"  # 1=hold back ```hermes-toolcalls from live stream
+# Off by default: the TUI shows the user's tasks, the model's real replies,
+# and Hermes' own tool feed (rendered natively from tool_calls). Opencode's
+# internal tool chatter is noise there — opt back in with
+# SHIM_NARRATE_TOOLS=1 only when diagnosing the backend itself.
+SHIM_NARRATE_TOOLS = os.environ.get("SHIM_NARRATE_TOOLS", "0") == "1"
+# On by default: the ```hermes-toolcalls block is shim-internal protocol —
+# Hermes only ever sees parsed tool_calls + stripped content, so the raw
+# fence must never flash in the TUI. Kill-switch (0) kept for debugging.
+SHIM_SUPPRESS_FENCE = os.environ.get("SHIM_SUPPRESS_FENCE", "1") == "1"  # 1=hold back ```hermes-toolcalls from live stream
 
 
 def _prompt_async(sid, body):
