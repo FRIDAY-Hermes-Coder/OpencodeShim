@@ -124,6 +124,44 @@ def _openai_error(message, etype="invalid_request", param=None, code=None):
 _UNSUPPORTED_PARAMS = ("logprobs", "top_logprobs", "seed", "logit_bias")
 
 
+# Hermes reasoning-effort vocabulary (PLAN v10, `/reasoning <level>`).
+# opencode serve 1.18.31 exposes these as provider-defined per-call
+# `variant` names (confirmed in its own /doc schema + the live
+# /config/providers entry: minimal/low/medium/high/xhigh with
+# reasoningEffort). none/minimal collapse to omitting the variant.
+_REASONING_LEVELS = ("none", "minimal", "low", "medium", "high", "xhigh")
+
+
+def _reasoning_variant(level):
+    """Map a Hermes reasoning_effort level to an opencode variant name.
+
+    Returns (variant|None, error|None): variant to attach to the serve
+    message body (None = omit, model default), error for unknown levels.
+    """
+    if level is None:
+        return None, None
+    if isinstance(level, dict):
+        level = level.get("effort")
+    if not level:
+        return None, None
+    if not isinstance(level, str):
+        return None, f"reasoning_effort must be a string level, got {type(level).__name__}"
+    lv = level.strip().lower()
+    if lv in ("", "none", "minimal"):
+        return None, None
+    if lv in ("low", "medium", "high", "xhigh"):
+        return lv, None
+    return None, (f"unknown reasoning_effort '{level}'. Supported: "
+                  "none, minimal, low, medium, high, xhigh")
+
+
+def _attach_variant(body, variant):
+    """Attach the opencode variant to a serve message body (omit when None)."""
+    if variant is not None:
+        body["variant"] = variant
+    return body
+
+
 def _compat_guard(body):
     """Phase-1 guards (§A.3/A.7). Returns (code, error_body) or None.
 
@@ -149,6 +187,18 @@ def _compat_guard(body):
             f"'{_p}' is not supported by this shim (opencode/Zen backend "
             "does not expose it)", "invalid_request",
             param=_p, code="unsupported_parameter"))
+    # reasoning_effort (PLAN v10): Hermes sends a level on every request
+    # believing it is honored — an unmappable level is a loud 400 here,
+    # never a silent no-op. Known levels pass; the variant mapping happens
+    # downstream in do_POST.
+    if body.get("reasoning_effort") is not None:
+        _, _rerr = _reasoning_variant(body.get("reasoning_effort"))
+        if _rerr:
+            return (400, _openai_error(
+                f"reasoning_effort not supported here: {_rerr} "
+                "(opencode serve exposes variants low/medium/high/xhigh for this model)",
+                "invalid_request",
+                param="reasoning_effort", code="unsupported_parameter"))
     return None
 
 
@@ -764,7 +814,7 @@ def _build_delta_prompt(delta, session_id, system_update, tools_section):
 
 
 def _run_session_turn(sid, prompt, file_parts, agent=None, model_override=None,
-                      serve_format=None):
+                      serve_format=None, reasoning_variant=None):
     """POST one turn to an existing opencode session (no create/delete)."""
     ok, health = _serve_call("GET", "/global/health", timeout=15)
     if not ok:
@@ -778,6 +828,7 @@ def _run_session_turn(sid, prompt, file_parts, agent=None, model_override=None,
         body["agent"] = agent
     if serve_format is not None:
         body["format"] = serve_format
+    _attach_variant(body, reasoning_variant)
     ok, resp = _serve_call(
         "POST", f"/session/{sid}/message", body,
         timeout=TIMEOUT,
@@ -1289,6 +1340,7 @@ def _do_session_turn(handler, t0, req_id, messages, tools, tool_choice,
                      stream, req_model, n_msgs, n_tools, profile_override=None,
                      stop=None, max_tokens=None, parallel_tool_calls=None,
                      response_format=None, include_usage=False, serve_format=None,
+                     reasoning_variant=None,
                      warnings=None):
     """L1 session path (§2): one Hermes conversation -> one opencode session.
 
@@ -1491,6 +1543,7 @@ def _do_session_turn(handler, t0, req_id, messages, tools, tool_choice,
             body["agent"] = agent
         if serve_format is not None:
             body["format"] = serve_format
+        _attach_variant(body, reasoning_variant)
         _wt = wall_timeout if wall_timeout is not None else TIMEOUT
         # stop/max_tokens no longer force whole-turn buffering: the gated
         # wrapper below forwards live and only stops once a cutoff actually
@@ -1520,7 +1573,8 @@ def _do_session_turn(handler, t0, req_id, messages, tools, tool_choice,
         # (anything later may already be running server-side — never double-run).
         if err_r.startswith("prompt_async"):
             ok_b, text_b, err_b = _run_session_turn(exec_sid, exec_prompt, exec_parts, agent, model_override=model_override,
-                                                    serve_format=serve_format)
+                                                    serve_format=serve_format,
+                                                    reasoning_variant=reasoning_variant)
             return ok_b, text_b, err_b, meta_r, False
         return False, "", err_r, meta_r, True
 
@@ -2794,7 +2848,8 @@ def _serve_call(method, path, payload=None, timeout=30):
         return False, f"serve unreachable: {e}"
 
 
-def run_opencode(prompt, images=None, file_parts=None, serve_format=None):
+def run_opencode(prompt, images=None, file_parts=None, serve_format=None,
+                 reasoning_variant=None):
     """Fast path: warm serve daemon (no subprocess cold boot).
 
     Preferred: pass ready serve file-parts via file_parts (see
@@ -2836,6 +2891,7 @@ def run_opencode(prompt, images=None, file_parts=None, serve_format=None):
                      "parts": parts}
         if serve_format is not None:
             _msg_body["format"] = serve_format
+        _attach_variant(_msg_body, reasoning_variant)
         ok, resp = _serve_call(
             "POST", f"/session/{sid}/message",
             _msg_body,
@@ -3162,6 +3218,11 @@ class Handler(BaseHTTPRequestHandler):
         response_format = body.get("response_format")
         # Single kill-switch (currently always None — see function docstring).
         serve_format = _serve_format_for_response_format(response_format)
+        # Reasoning effort (PLAN v10): validated by _compat_guard above, so
+        # this mapping cannot fail here — defensive fallback to None.
+        reasoning_variant, _rerr = _reasoning_variant(body.get("reasoning_effort"))
+        if _rerr:
+            reasoning_variant = None
         include_usage = bool((body.get("stream_options") or {}).get("include_usage")) \
             if isinstance(body.get("stream_options"), dict) else False
         # Sampling params (§A.5): opencode serve's message body
@@ -3192,6 +3253,7 @@ class Handler(BaseHTTPRequestHandler):
                              response_format=response_format,
                              include_usage=include_usage,
                              serve_format=serve_format,
+                             reasoning_variant=reasoning_variant,
                              warnings=_warnings)
             return
         prompt, atts_raw = messages_to_prompt(messages, tools, tool_choice)
@@ -3276,7 +3338,8 @@ class Handler(BaseHTTPRequestHandler):
             return
         try:
             ok, out, err = run_opencode(prompt, file_parts=file_parts,
-                                        serve_format=serve_format)
+                                        serve_format=serve_format,
+                                        reasoning_variant=reasoning_variant)
         finally:
             _sem.release()
 
@@ -3391,7 +3454,8 @@ class Handler(BaseHTTPRequestHandler):
                     try:
                         _rf_ok_r, _rf_out_r, _rf_err_r = run_opencode(
                             _rf_repair_prompt, file_parts=file_parts,
-                            serve_format=serve_format)
+                            serve_format=serve_format,
+                            reasoning_variant=reasoning_variant)
                     finally:
                         _sem.release()
                 else:
